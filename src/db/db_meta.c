@@ -1,7 +1,7 @@
 /*-
- * See the file LICENSE for redistribution information.
+ * Copyright (c) 1996, 2020 Oracle and/or its affiliates.  All rights reserved.
  *
- * Copyright (c) 1996, 2012 Oracle and/or its affiliates.  All rights reserved.
+ * See the file LICENSE for license information.
  */
 /*
  * Copyright (c) 1990, 1993, 1994, 1995, 1996
@@ -108,6 +108,8 @@ __db_new(dbc, type, lockp, pagepp)
 	PAGE *h;
 	db_pgno_t last, *list, pgno, newnext;
 	int extend, hash, ret;
+
+	COMPQUIET(last, 0);
 
 	meta = NULL;
 	dbp = dbc->dbp;
@@ -583,7 +585,7 @@ err:	if (h != NULL && (t_ret = __memp_fput(mpf,
 
 	PERFMON4(dbp->env, alloc, free, dbp->fname, dbp->dname, pgno, ret);
 	/*
-	 * XXX
+	 * !!!
 	 * We have to unlock the caller's page in the caller!
 	 */
 	return (ret);
@@ -939,12 +941,14 @@ done:	if (last_pgnop != NULL)
 		*last_pgnop = meta->last_pgno;
 
 	/*
-	 * The truncate point is the number of pages in the free
-	 * list back from the last page.  The number of pages
-	 * in the free list are the number that we can swap in.
-	 * Adjust it down slightly so if we find higher numbered
-	 * pages early and then free other pages later we can
-	 * truncate them.
+	 * Set the truncation point which determines which pages may be
+	 * relocated. Pages above are candidates to be swapped with a lower one
+	 * from the freelist by __db_exchange_page(); pages before the truncate
+	 * point are not relocated.
+	 * The truncation point starts as N pages less than the last_pgno, where
+	 * N is the size of the free list. This is reduced by 1/4 in the hope
+	 * that partially full pages will be coalesced together, creating
+	 * additional free pages during the compact.
 	 */
 	if (c_data) {
 		c_data->compact_truncate = (u_int32_t)meta->last_pgno - nelems;
@@ -1328,8 +1332,9 @@ __db_haslock(env, locker, dbmfp, pgno, mode, type)
 }
 /*
  * __db_has_pagelock --
- *	Determine if this locker holds a particular page lock.
- *	Returns 0 if lock is held, non-zero otherwise.
+ *	Determine if this locker holds a particular page lock, and return an
+ *	error if it is missing a page lock that it should have.
+ *	Otherwise (TDS with the page locked, or DS or CDS) return 0.
  *
  * PUBLIC: #ifdef DIAGNOSTIC
  * PUBLIC: int __db_has_pagelock __P((ENV *, DB_LOCKER *,
@@ -1345,6 +1350,9 @@ __db_has_pagelock(env, locker, dbmfp, pagep, mode)
 	db_lockmode_t mode;
 {
 	int ret;
+
+	if (!FLD_ISSET(env->open_flags, DB_INIT_TXN))
+		return (0);
 
 	switch (pagep->type) {
 	case P_OVERFLOW:

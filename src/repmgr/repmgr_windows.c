@@ -1,7 +1,7 @@
 /*-
- * See the file LICENSE for redistribution information.
+ * Copyright (c) 2005, 2020 Oracle and/or its affiliates.  All rights reserved.
  *
- * Copyright (c) 2005, 2012 Oracle and/or its affiliates.  All rights reserved.
+ * See the file LICENSE for license information.
  *
  * $Id$
  */
@@ -252,7 +252,7 @@ allocate_wait_slot(env, resultp, table)
 	 * the previous wait but before reacquiring the mutex, and this
 	 * extra signal would incorrectly cause the next wait to return
 	 * immediately.
-	 */ 
+	 */
 	(void)WaitForSingleObject(w->event, 0);
 	*resultp = i;
 	return (0);
@@ -639,31 +639,40 @@ __repmgr_select_loop(env)
 	WSAEVENT listen_event;
 	WSANETWORKEVENTS net_events;
 	struct io_info io_info;
-	int i;
+	int accept_connect, i;
 
 	db_rep = env->rep_handle;
 	io_info.connections = connections;
 	io_info.events = events;
+	accept_connect = FALSE;
 
 	if ((listen_event = WSACreateEvent()) == WSA_INVALID_EVENT) {
 		__db_err(env, net_errno, DB_STR("3590",
 		    "can't create event for listen socket"));
 		return (net_errno);
 	}
-	if (!IS_SUBORDINATE(db_rep) &&
-	    WSAEventSelect(db_rep->listen_fd, listen_event, FD_ACCEPT) ==
-	    SOCKET_ERROR) {
-		ret = net_errno;
-		__db_err(env, ret, DB_STR("3591",
-		    "can't enable event for listener"));
-		(void)WSACloseEvent(listen_event);
-		goto out;
-	}
 
 	LOCK_MUTEX(db_rep->mutex);
 	if ((ret = __repmgr_first_try_connections(env)) != 0)
 		goto unlock;
 	for (;;) {
+		/*
+		 * Set the event for this process to receive notification of
+		 * incoming connections if this process is or has just taken
+		 * over as the listener process.
+		 */
+		if (!IS_SUBORDINATE(db_rep) && !accept_connect) {
+			if (WSAEventSelect(db_rep->listen_fd, listen_event,
+			    FD_ACCEPT) == SOCKET_ERROR) {
+				ret = net_errno;
+				__db_err(env, ret, DB_STR("3700",
+				    "can't enable event for listener"));
+				(void)WSACloseEvent(listen_event);
+				goto out;
+			}
+			accept_connect = TRUE;
+		}
+
 		/* Start with the two events that we always wait for. */
 #define	SIGNALER_INDEX	0
 #define	LISTENER_INDEX	1
@@ -714,6 +723,8 @@ __repmgr_select_loop(env)
 					ret = net_errno;
 					goto unlock;
 				}
+				if (net_events.lNetworkEvents == 0)
+					continue;
 				DB_ASSERT(env,
 				    net_events.lNetworkEvents & FD_ACCEPT);
 				if ((ret = net_events.iErrorCode[FD_ACCEPT_BIT])
@@ -747,6 +758,13 @@ out:
 	(void)__repmgr_net_close(env);
 	UNLOCK_MUTEX(db_rep->mutex);
 	return (ret);
+}
+
+int
+__repmgr_network_event_handler(env)
+	ENV *env;
+{
+	return (__repmgr_select_loop(env));
 }
 
 static int
@@ -802,8 +820,19 @@ handle_completion(env, conn)
 	ENV *env;
 	REPMGR_CONNECTION *conn;
 {
-	int error, ret;
+	int error, ret, ssl_read_possible, ssl_write_possible;
+	int read_event_allowed, write_event_allowed;
+	int use_ssl_api;
 	WSANETWORKEVENTS events;
+
+	read_event_allowed = 0;
+	write_event_allowed = 0;
+	use_ssl_api = 0;
+
+#if defined(HAVE_REPMGR_SSL)
+	if (IS_REPMGR_SSL_ENABLED(env))
+		use_ssl_api = 1;
+#endif
 
 	if ((ret = WSAEnumNetworkEvents(conn->fd, conn->event_object, &events))
 	    == SOCKET_ERROR) {
@@ -812,28 +841,76 @@ handle_completion(env, conn)
 		goto report;
 	}
 
-	/* Check both writing and reading. */
-	if (events.lNetworkEvents & FD_CLOSE) {
-		error = events.iErrorCode[FD_CLOSE_BIT];
-		goto report;
+	read_event_allowed = events.lNetworkEvents & (FD_CLOSE | FD_READ);
+	write_event_allowed = events.lNetworkEvents & FD_WRITE;
+
+	if (use_ssl_api) {
+#if defined(HAVE_REPMGR_SSL)
+		ssl_read_possible = __repmgr_ssl_read_possible(conn,
+		    read_event_allowed, write_event_allowed);
+
+		ssl_write_possible = __repmgr_ssl_write_possible(conn,
+		    read_event_allowed, write_event_allowed);
+#endif
+	} else {
+		ssl_read_possible = read_event_allowed;
+		ssl_write_possible = write_event_allowed;
 	}
 
-	if (events.lNetworkEvents & FD_WRITE) {
+	/* Check both writing and reading. */
+	if (ssl_read_possible && (events.lNetworkEvents & FD_CLOSE)) {
+		error = events.iErrorCode[FD_CLOSE_BIT];
+
+		/*
+		 * There could be data for reading when we see FD_CLOSE,
+		 * so we should try reading in this case.
+		 */
+		if (error != 0)
+			goto report;
+		else if ((ret =
+		    __repmgr_read_from_site(env, conn)) != 0)
+			goto err;
+	}
+
+	if (ssl_write_possible && (events.lNetworkEvents & FD_WRITE)) {
 		if (events.iErrorCode[FD_WRITE_BIT] != 0) {
 			error = events.iErrorCode[FD_WRITE_BIT];
 			goto report;
 		} else if ((ret =
-			__repmgr_write_some(env, conn)) != 0)
+		    __repmgr_write_some(env, conn)) != 0)
 			goto err;
 	}
 
-	if (events.lNetworkEvents & FD_READ) {
+	if (use_ssl_api) {
+#if defined(HAVE_REPMGR_SSL)
+		if (ssl_write_possible && !(events.lNetworkEvents & FD_WRITE)) {
+			if ((ret = __repmgr_write_some(env, conn)) != 0)
+				goto err;
+
+			return (ret);
+		}
+#endif
+	}
+
+	if (ssl_read_possible && events.lNetworkEvents & FD_READ) {
 		if (events.iErrorCode[FD_READ_BIT] != 0) {
 			error = events.iErrorCode[FD_READ_BIT];
 			goto report;
 		} else if ((ret =
-			__repmgr_read_from_site(env, conn)) != 0)
+		    __repmgr_read_from_site(env, conn)) != 0)
 			goto err;
+	}
+
+	if (use_ssl_api) {
+#if defined(HAVE_REPMGR_SSL)
+		if (ssl_read_possible && !(events.lNetworkEvents
+		    & (FD_READ | FD_CLOSE))) {
+			if ((ret = __repmgr_read_from_site(env, conn)) != 0)
+				goto err;
+
+			return (ret);
+		}
+#endif
 	}
 
 	if (0) {

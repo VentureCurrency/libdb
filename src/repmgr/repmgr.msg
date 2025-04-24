@@ -27,7 +27,23 @@ ARG	ack_policy	u_int32_t
 ARG	flags		u_int32_t
 END
 
+BEGIN_MSG v6permlsn
+ARG	generation	u_int32_t
+ARG	lsn		DB_LSN
+END
+
 BEGIN_MSG permlsn
+ARG	generation	u_int32_t
+ARG	lsn		DB_LSN
+ARG	last_ckp_lsn	DB_LSN
+END
+
+BEGIN_MSG heartbeat
+ARG	generation	u_int32_t
+ARG	lsn		DB_LSN
+END
+
+BEGIN_MSG readonly_response
 ARG	generation	u_int32_t
 ARG	lsn		DB_LSN
 END
@@ -65,6 +81,11 @@ ARG	port		u_int16_t
 END
 
 BEGIN_MSG membership_data
+ARG	status          u_int32_t
+ARG	flags           u_int32_t
+END
+
+BEGIN_MSG v4membership_data
 ARG	flags           u_int32_t
 END
 
@@ -75,7 +96,7 @@ END
  * DB releases.  The "version" counts group changes that the application makes
  * by adding or removing sites; thus it varies dynamically thoughout the life of
  * a group, during a single release of Berkeley DB.
- */ 
+ */
 BEGIN_MSG member_metadata
 ARG	format		u_int32_t
 ARG	version		u_int32_t
@@ -98,7 +119,15 @@ BEGIN_MSG membr_vers
 ARG	version		u_int32_t
 ARG	gen		u_int32_t
 END
+
 BEGIN_MSG site_info check_length
+ARG	host		DBT
+ARG	port		u_int16_t
+ARG	status		u_int32_t
+ARG	flags		u_int32_t
+END
+
+BEGIN_MSG v4site_info check_length
 ARG	host		DBT
 ARG	port		u_int16_t
 ARG	flags		u_int32_t
@@ -107,13 +136,34 @@ END
 /*
  * If site A breaks or rejects a connection from site B, it first
  * tries to send B this message containing site A's currently known
- * membership DB version.  Site B can use this to decide what to do.
- * If site B knows of a later version, it should retry the connection
- * to site A later, polling at it until site A catches up.  However, if
- * site B's known version is less, it means that site B is no longer in 
- * the group, and so instead it should shut down and notify the application.
+ * membership DB version and site B's status in site A's membership DB.
+ * Site B can use them to decide what to do.  If site B knows of a later
+ * version, it should retry the connection to site A later, polling
+ * until site A catches up.  However, if site B's known version is
+ * less and site B's status is adding in site A's membership DB, it
+ * means that a badly-timed change of master may have caused the current
+ * master to lose B's membership DB update to present, so it should
+ * retry the connection to site A later, otherwise, site B is no longer
+ * in the group and it should shut down and notify the application.
  */
 BEGIN_MSG connect_reject
 ARG	version		u_int32_t
 ARG	gen		u_int32_t
+ARG	status		u_int32_t
+END
+
+BEGIN_MSG v4connect_reject
+ARG	version		u_int32_t
+ARG	gen		u_int32_t
+END
+
+/*
+ * For preferred master LSN history comparison between the sites.
+ * The next_gen_lsn is [0,0] if the next generation doesn't yet exist.
+ */
+BEGIN_MSG lsnhist_match
+ARG	lsn		DB_LSN
+ARG	hist_sec	u_int32_t
+ARG	hist_nsec	u_int32_t
+ARG	next_gen_lsn	DB_LSN
 END

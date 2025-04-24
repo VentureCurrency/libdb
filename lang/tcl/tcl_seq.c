@@ -1,7 +1,7 @@
 /*-
- * See the file LICENSE for redistribution information.
+ * Copyright (c) 2004, 2020 Oracle and/or its affiliates.  All rights reserved.
  *
- * Copyright (c) 2004, 2012 Oracle and/or its affiliates.  All rights reserved.
+ * See the file LICENSE for license information.
  *
  * $Id$
  */
@@ -77,7 +77,8 @@ seq_Cmd(clientData, interp, objc, objv)
 	DB_SEQUENCE *seq;
 	Tcl_Obj *myobjv[2], *res;
 	db_seq_t min, max;
-	int cmdindex, ncache, result, ret;
+	int cmdindex, result, ret;
+	u_int32_t ncache;
 
 	Tcl_ResetResult(interp);
 	seq = (DB_SEQUENCE *)clientData;
@@ -140,7 +141,7 @@ seq_Cmd(clientData, interp, objc, objv)
 		ret = seq->get_cachesize(seq, &ncache);
 		if ((result = _ReturnSetup(interp, ret,
 		    DB_RETOK_STD(ret), "sequence get_cachesize")) == TCL_OK)
-			res = Tcl_NewIntObj(ncache);
+			res = Tcl_NewIntObj((int)ncache);
 		break;
 	case SEQGETDB:
 		if (objc != 2) {
@@ -203,14 +204,18 @@ tcl_SeqStat(interp, objc, objv, seq)
 	flag = 0;
 
 	if (objc > 3) {
-		Tcl_WrongNumArgs(interp, 2, objv, "?-clear?");
+		Tcl_WrongNumArgs(interp, 2, objv, "?-all? ?-clear?");
 		return (TCL_ERROR);
 	}
 
 	if (objc == 3) {
 		arg = Tcl_GetStringFromObj(objv[2], NULL);
-		if (strcmp(arg, "-clear") == 0)
+		if (strcmp(arg, "-all") == 0) {
+			flag = DB_STAT_ALL;
+		}
+		else if (strcmp(arg, "-clear") == 0) {
 			flag = DB_STAT_CLEAR;
+		}
 		else {
 			Tcl_SetResult(interp,
 			    "db stat: unknown arg", TCL_STATIC);
@@ -266,10 +271,12 @@ tcl_SeqStatPrint(interp, objc, objv, seq)
 	DB_SEQUENCE *seq;		/* Environment pointer */
 {	
 	static const char *seqstatprtopts[] = {
+		"-all",
 		"-clear",
 		 NULL
 	};
 	enum seqstatprtopts {
+		SEQSTATPRTALL,
 		SEQSTATPRTCLEAR
 	};
 	u_int32_t flag;
@@ -287,6 +294,9 @@ tcl_SeqStatPrint(interp, objc, objv, seq)
 		}
 		i++;
 		switch ((enum seqstatprtopts)optindex) {
+		case SEQSTATPRTALL:
+			flag |= DB_STAT_ALL;
+			break;
 		case SEQSTATPRTCLEAR:
 			flag |= DB_STAT_CLEAR;
 			break;
@@ -422,7 +432,7 @@ tcl_SeqGet(interp, objc, objv, seq)
 	if ((result = _GetUInt32(interp, objv[objc - 1], &delta)) != TCL_OK)
 		goto out;
 
-	ret = seq->get(seq, txn, (int32_t)delta, &value, aflag);
+	ret = seq->get(seq, txn, delta, &value, aflag);
 	result = _ReturnSetup(interp, ret, DB_RETOK_DBGET(ret), "sequence get");
 	if (ret == 0) {
 		res = Tcl_NewWideIntObj((Tcl_WideInt)value);
@@ -458,8 +468,6 @@ tcl_SeqRemove(interp, objc, objv, seq, ip)
 	result = TCL_OK;
 	txn = NULL;
 	aflag = 0;
-
-	_DeleteInfo(ip);
 
 	if (objc < 2) {
 		Tcl_WrongNumArgs(interp, 2, objv, "?-args?");
@@ -510,6 +518,7 @@ tcl_SeqRemove(interp, objc, objv, seq, ip)
 	if (result != TCL_OK)
 		goto out;
 
+	_DeleteInfo(ip);
 	ret = seq->remove(seq, txn, aflag);
 	result = _ReturnSetup(interp,
 	    ret, DB_RETOK_DBGET(ret), "sequence remove");
@@ -555,9 +564,10 @@ tcl_SeqGetFlags(interp, objc, objv, seq)
 		for (i = 0; seq_flags[i].flag != 0; i++)
 			if (LF_ISSET(seq_flags[i].flag)) {
 				if (strlen(buf) > 0)
-					(void)strncat(buf, " ", sizeof(buf));
-				(void)strncat(
-				    buf, seq_flags[i].arg, sizeof(buf));
+					(void)strncat(buf, " ",
+					    sizeof(buf) - (strlen(buf) + 1));
+				(void)strncat(buf, seq_flags[i].arg,
+				    sizeof(buf) - (strlen(buf) + 1));
 			}
 
 		res = NewStringObj(buf, strlen(buf));

@@ -1,7 +1,7 @@
 /*-
- * See the file LICENSE for redistribution information.
+ * Copyright (c) 2006, 2020 Oracle and/or its affiliates.  All rights reserved.
  *
- * Copyright (c) 2006, 2012 Oracle and/or its affiliates.  All rights reserved.
+ * See the file LICENSE for license information.
  *
  * $Id$
  */
@@ -92,6 +92,8 @@ __memp_skip_curadj(dbc, pgno)
 	MP_GET_BUCKET(env, mfp, pgno, &infop, hp, bucket, ret);
 	if (ret != 0) {
 		/* Panic: there is no way to return the error. */
+		__db_err(env, ret,
+		    "__memp_skip_curadj: bucket lookup for %ld", (u_long)pgno);
 		(void)__env_panic(env, ret);
 		return (0);
 	}
@@ -151,6 +153,11 @@ __memp_bh_freeze(dbmp, infop, hp, bhp, need_frozenp)
 	real_name = NULL;
 	fhp = NULL;
 
+	if (FLD_ISSET(env->dbenv->verbose, DB_VERB_MVCC))
+		__db_msg(env, "freeze %s %d @%lu/%lu", __memp_fns(dbmp, mfp),
+		    bhp->pgno, (u_long)VISIBLE_LSN(env, bhp)->file,
+		    (u_long)VISIBLE_LSN(env, bhp)->offset);
+
 	MVCC_MPROTECT(bhp->buf, pagesize, PROT_READ | PROT_WRITE);
 
 	MPOOL_REGION_LOCK(env, infop);
@@ -161,7 +168,7 @@ __memp_bh_freeze(dbmp, infop, hp, bhp, need_frozenp)
 	} else {
 		*need_frozenp = 1;
 
-		/* There might be a small amount of unallocated space. */
+		/* There might be enough space for a single-item block. */
 		if (__env_alloc(infop,
 		    sizeof(BH_FROZEN_ALLOC) + sizeof(BH_FROZEN_PAGE),
 		    &frozen_alloc) == 0) {
@@ -194,7 +201,7 @@ __memp_bh_freeze(dbmp, infop, hp, bhp, need_frozenp)
 	    (u_long)ncache, (u_long)nbucket, (u_long)pagesize / 1024);
 
 	if ((ret = __db_appname(env,
-	    DB_APP_NONE, filename, NULL, &real_name)) != 0)
+	    DB_APP_REGION, filename, NULL, &real_name)) != 0)
 		goto err;
 
 	MUTEX_LOCK(env, hp->mtx_hash);
@@ -233,7 +240,7 @@ __memp_bh_freeze(dbmp, infop, hp, bhp, need_frozenp)
 	    &maxpgno, sizeof(db_pgno_t), &nio)) != 0)
 		goto err;
 	if (magic != DB_FREEZER_MAGIC) {
-		ret = EINVAL;
+		ret = USR_ERR(env, EINVAL);
 		goto err;
 	}
 	if (newpgno == 0) {
@@ -276,7 +283,7 @@ __memp_bh_freeze(dbmp, infop, hp, bhp, need_frozenp)
 #else
 	memcpy(frozen_bhp, bhp, SSZA(BH, buf));
 #endif
-	atomic_init(&frozen_bhp->ref, 0);
+	atomic_write(&frozen_bhp->ref, 0);
 	if (mutex != MUTEX_INVALID)
 		frozen_bhp->mtx_buf = mutex;
 	else if ((ret = __mutex_alloc(env, MTX_MPOOL_BH,
@@ -405,6 +412,12 @@ __memp_bh_thaw(dbmp, infop, hp, frozen_bhp, alloc_bhp)
 	ret = 0;
 	real_name = NULL;
 
+	if (FLD_ISSET(env->dbenv->verbose, DB_VERB_MVCC))
+		__db_msg(env, "thaw %s %d @%lu/%lu", __memp_fns(dbmp, mfp),
+		    frozen_bhp->pgno,
+		    (u_long)VISIBLE_LSN(env, frozen_bhp)->file,
+		    (u_long)VISIBLE_LSN(env, frozen_bhp)->offset);
+
 	MUTEX_REQUIRED(env, hp->mtx_hash);
 	DB_ASSERT(env, F_ISSET(frozen_bhp, BH_EXCLUSIVE) || alloc_bhp == NULL);
 	h_locked = 1;
@@ -414,7 +427,8 @@ __memp_bh_thaw(dbmp, infop, hp, frozen_bhp, alloc_bhp)
 	DB_ASSERT(env, alloc_bhp != NULL ||
 	    SH_CHAIN_SINGLETON(frozen_bhp, vc) ||
 	    (SH_CHAIN_HASNEXT(frozen_bhp, vc) &&
-	    BH_OBSOLETE(frozen_bhp, hp->old_reader, vlsn)));
+	    BH_OBSOLETE(frozen_bhp, hp->old_reader, vlsn)) ||
+	    F_ISSET(frozen_bhp, BH_UNREACHABLE));
 	DB_ASSERT(env, alloc_bhp == NULL || !F_ISSET(alloc_bhp, BH_FROZEN));
 
 	spgno = ((BH_FROZEN_PAGE *)frozen_bhp)->spgno;
@@ -428,7 +442,7 @@ __memp_bh_thaw(dbmp, infop, hp, frozen_bhp, alloc_bhp)
 #endif
 		alloc_bhp->mtx_buf = mutex;
 		MUTEX_LOCK(env, alloc_bhp->mtx_buf);
-		atomic_init(&alloc_bhp->ref, 1);
+		atomic_write(&alloc_bhp->ref, 1);
 		F_CLR(alloc_bhp, BH_FROZEN);
 	}
 
@@ -443,7 +457,7 @@ __memp_bh_thaw(dbmp, infop, hp, frozen_bhp, alloc_bhp)
 	    (u_long)ncache, (u_long)nbucket, (u_long)pagesize / 1024);
 
 	if ((ret = __db_appname(env,
-	    DB_APP_NONE, filename, NULL, &real_name)) != 0)
+	    DB_APP_REGION, filename, NULL, &real_name)) != 0)
 		goto err;
 	if ((ret = __os_open(env,
 	    real_name, pagesize, 0, env->db_mode, &fhp)) != 0)
@@ -460,7 +474,7 @@ __memp_bh_thaw(dbmp, infop, hp, frozen_bhp, alloc_bhp)
 		goto err;
 
 	if (magic != DB_FREEZER_MAGIC) {
-		ret = EINVAL;
+		ret = USR_ERR(env, EINVAL);
 		goto err;
 	}
 
@@ -516,7 +530,7 @@ __memp_bh_thaw(dbmp, infop, hp, frozen_bhp, alloc_bhp)
 		else {
 			maxpgno -= (db_pgno_t)ntrunc;
 			if ((ret = __os_truncate(env, fhp,
-			    maxpgno + 1, pagesize)) != 0)
+			    maxpgno + 1, pagesize, 0)) != 0)
 				goto err;
 
 			/* Fix up the linked list */

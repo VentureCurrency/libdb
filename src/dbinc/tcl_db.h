@@ -1,7 +1,7 @@
 /*-
- * See the file LICENSE for redistribution information.
+ * Copyright (c) 1999, 2020 Oracle and/or its affiliates.  All rights reserved.
  *
- * Copyright (c) 1999, 2012 Oracle and/or its affiliates.  All rights reserved.
+ * See the file LICENSE for license information.
  *
  * $Id$
  */
@@ -16,7 +16,8 @@ extern "C" {
 #define	MSG_SIZE 100		/* Message size */
 
 enum INFOTYPE {
-	I_AUX, I_DB, I_DBC, I_ENV, I_LOCK, I_LOGC, I_MP, I_NDBM, I_PG, I_SEQ, I_TXN};
+	I_AUX, I_DB, I_DBC, I_DBSTREAM, I_ENV,
+	I_LOCK, I_LOGC, I_MP, I_NDBM, I_PG, I_SEQ, I_TXN};
 
 #define	MAX_ID		8	/* Maximum number of sub-id's we need */
 #define	DBTCL_PREP	64	/* Size of txn_recover preplist */
@@ -24,9 +25,11 @@ enum INFOTYPE {
 #define	DBTCL_DBM	1
 #define	DBTCL_NDBM	2
 
-#define	DBTCL_GETCLOCK		0
-#define	DBTCL_GETLIMIT		1
-#define	DBTCL_GETREQ		2
+#define	DBTCL_GETCLOCK			0
+#define	DBTCL_GETINQUEUE_MAX		1
+#define	DBTCL_GETINQUEUE_REDZONE	2
+#define	DBTCL_GETLIMIT			3
+#define	DBTCL_GETREQ			4
 
 #define	DBTCL_MUT_ALIGN	0
 #define	DBTCL_MUT_INCR	1
@@ -36,9 +39,11 @@ enum INFOTYPE {
 
 /*
  * Data structure to record information about events that have occurred.  Tcl
- * command "env event_info" can retrieve the information.  For now, we record
- * only one occurrence per event type; "env event_info -clear" can be used to
- * reset the info.
+ * command "env event_info" can retrieve all the information except the number
+ * of times, and "env event_count" can retrieve the number of times a specific
+ * event is fired.  We added "env event_count" instead of merging the times
+ * information into "env event_info" to avoid breaking the existing tests.
+ * Tcl command "env event_info -clear" can be used to reset the info.
  *
  * Besides the bit flag that records the fact that an event type occurred, some
  * event types have associated "info" and we record that here too.  When new
@@ -47,16 +52,17 @@ enum INFOTYPE {
  * with the "env event_info" results.
  */
 typedef struct dbtcl_event_info {
-	u_int32_t	events;	/* Bit flag on for each event fired. */
-	int		panic_error;
-	int		newmaster_eid;
-	int		added_eid;
-	int		removed_eid;
-	pid_t		attached_process;
-	int		connected_eid;
+	u_int32_t	  events;	/* Bit flag on for each event fired. */
+	int		  panic_error;
+	int		  newmaster_eid;
+	int		  added_eid;
+	int		  removed_eid;
+	pid_t		  attached_process;
+	int		  connected_eid;
 	DB_REPMGR_CONN_ERR conn_broken_info;
 	DB_REPMGR_CONN_ERR conn_failed_try_info;
-	DB_LSN		sync_point;
+	DB_LSN		  sync_point;
+	size_t		  count[32]; /* The number of times for each event. */
 } DBTCL_EVENT_INFO;
 
 /*
@@ -99,6 +105,7 @@ typedef struct dbtcl_info {
 		DB_LOCK *lock;
 		DB_LOGC *logc;
 		DB_MPOOLFILE *mp;
+		DB_STREAM *dbsp;
 		DB_TXN *txnp;
 		void *anyp;
 	} un;
@@ -119,6 +126,7 @@ typedef struct dbtcl_info {
 	FILE *i_err;
 	char *i_errpfx;
 	FILE *i_msg;
+	char *i_msgpfx;
 
 	/* Callbacks--Tcl_Objs containing proc names */
 	Tcl_Obj *i_compare;
@@ -128,7 +136,9 @@ typedef struct dbtcl_info {
 	Tcl_Obj *i_isalive;
 	Tcl_Obj *i_part_callback;
 	Tcl_Obj *i_rep_send;
+	Tcl_Obj *i_rep_view;
 	Tcl_Obj *i_second_call;
+	Tcl_Obj *i_slice_callback;
 
 	/* Environment ID for the i_rep_send callback. */
 	Tcl_Obj *i_rep_eid;
@@ -144,6 +154,7 @@ typedef struct dbtcl_info {
 #define	i_anyp un.anyp
 #define	i_dbp un.dbp
 #define	i_dbcp un.dbcp
+#define	i_dbsp un.dbsp
 #define	i_envp un.envp
 #define	i_lock un.lock
 #define	i_logc un.logc
@@ -165,10 +176,14 @@ typedef struct dbtcl_info {
 #define	i_envmpid i_otherid[1]
 #define	i_envlockid i_otherid[2]
 #define	i_envlogcid i_otherid[3]
+#define	i_envsliceid i_otherid[4]
 
 #define	i_mppgid  i_otherid[0]
 
 #define	i_dbdbcid i_otherid[0]
+#define	i_dbsliceid i_otherid[1]
+
+#define	i_dbcdbsid i_otherid[0]
 
 extern int __debug_on, __debug_print, __debug_stop, __debug_test;
 
@@ -202,6 +217,7 @@ extern DBTCL_GLOBAL __dbtcl_global;
  * functions this will typically go before the "free" function to free the
  * stat structure returned by DB.
  */
+#ifdef HAVE_STATISTICS
 #define	MAKE_STAT_LIST(s, v) do {					\
 	result = _SetListElemInt(interp, res, (s), (long)(v));		\
 	if (result != TCL_OK)						\
@@ -213,12 +229,17 @@ extern DBTCL_GLOBAL __dbtcl_global;
 	if (result != TCL_OK)						\
 		goto error;						\
 } while (0)
+#else
+/* These do-nothing versions streamline the code & reduce warning messages. */
+#define	MAKE_STAT_LIST(s, v)	if (0) goto error
+#define	MAKE_WSTAT_LIST(s, v)	if (0) goto error
+#endif
 
 /*
  * MAKE_STAT_LSN appends a {name {LSNfile LSNoffset}} pair to a result list
  * that MUST be called 'res' that is a Tcl_Obj * in the local
  * function.  This macro also assumes a label "error" to go to
- * in the even of a Tcl error.  For stat functions this will
+ * in the event of a Tcl error.  For stat functions this will
  * typically go before the "free" function to free the stat structure
  * returned by DB.
  */
@@ -240,7 +261,7 @@ extern DBTCL_GLOBAL __dbtcl_global;
  * MAKE_STAT_STRLIST appends a {name string} pair to a result list
  * that MUST be called 'res' that is a Tcl_Obj * in the local
  * function.  This macro also assumes a label "error" to go to
- * in the even of a Tcl error.  For stat functions this will
+ * in the event of a Tcl error.  For stat functions this will
  * typically go before the "free" function to free the stat structure
  * returned by DB.
  */
@@ -252,18 +273,23 @@ extern DBTCL_GLOBAL __dbtcl_global;
 } while (0)
 
 /*
- * MAKE_SITE_LIST appends a {eid host port status} tuple to a result list
- * that MUST be called 'res' that is a Tcl_Obj * in the local function.
- * This macro also assumes a label "error" to go to in the event of a Tcl
- * error.
+ * MAKE_SITE_LIST appends a
+ * {eid host port status peer view unelect maxackfile maxackoffset}
+ * tuple to a result list that MUST be called 'res' that is a Tcl_Obj * in
+ * the local function.  This macro also assumes a label "error" to go to in
+ * the event of a Tcl error.
  */
-#define	MAKE_SITE_LIST(e, h, p, s, pr) do {				\
-	myobjc = 5;							\
+#define	MAKE_SITE_LIST(e, h, p, s, pr, vw, el, maf, mao) do {		\
+	myobjc = 9;							\
 	myobjv[0] = Tcl_NewIntObj(e);					\
 	myobjv[1] = Tcl_NewStringObj((h), (int)strlen(h));		\
 	myobjv[2] = Tcl_NewIntObj((int)p);				\
 	myobjv[3] = Tcl_NewStringObj((s), (int)strlen(s));		\
 	myobjv[4] = Tcl_NewStringObj((pr), (int)strlen(pr));		\
+	myobjv[5] = Tcl_NewStringObj((vw), (int)strlen(vw));		\
+	myobjv[6] = Tcl_NewStringObj((el), (int)strlen(el));		\
+	myobjv[7] = Tcl_NewLongObj((long)(maf));			\
+	myobjv[8] = Tcl_NewLongObj((long)(mao));			\
 	thislist = Tcl_NewListObj(myobjc, myobjv);			\
 	result = Tcl_ListObjAppendElement(interp, res, thislist);	\
 	if (result != TCL_OK)						\

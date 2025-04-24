@@ -1,7 +1,7 @@
 /*-
- * See the file LICENSE for redistribution information.
+ * Copyright (c) 1996, 2020 Oracle and/or its affiliates.  All rights reserved.
  *
- * Copyright (c) 1996, 2012 Oracle and/or its affiliates.  All rights reserved.
+ * See the file LICENSE for license information.
  *
  * $Id$
  */
@@ -73,6 +73,69 @@ __repmgr_set_ack_policy(dbenv, policy)
 
 /*
  * PUBLIC: #ifndef HAVE_REPLICATION_THREADS
+ * PUBLIC: int __repmgr_get_incoming_queue_max __P((DB_ENV *, u_int32_t *,
+ * PUBLIC:     u_int32_t *));
+ * PUBLIC: #endif
+ */
+int
+__repmgr_get_incoming_queue_max(dbenv, messagesp, bulk_messagesp)
+	DB_ENV *dbenv;
+	u_int32_t *messagesp;
+	u_int32_t *bulk_messagesp;
+{
+	COMPQUIET(messagesp, NULL);
+	COMPQUIET(bulk_messagesp, NULL);
+	return (__db_norepmgr(dbenv));
+}
+
+/*
+ * PUBLIC: #ifndef HAVE_REPLICATION_THREADS
+ * PUBLIC: int __repmgr_set_incoming_queue_max __P((DB_ENV *, u_int32_t,
+ * PUBLIC:     u_int32_t));
+ * PUBLIC: #endif
+ */
+int
+__repmgr_set_incoming_queue_max(dbenv, messages, bulk_messages)
+	DB_ENV *dbenv;
+	u_int32_t messages;
+	u_int32_t bulk_messages;
+{
+	COMPQUIET(messages, 0);
+	COMPQUIET(bulk_messages, 0);
+	return (__db_norepmgr(dbenv));
+}
+
+/*
+ * PUBLIC: #ifndef HAVE_REPLICATION_THREADS
+ * PUBLIC: int __repmgr_get_incoming_queue_redzone __P((DB_ENV *,
+ * PUBLIC:     u_int32_t *, u_int32_t *));
+ * PUBLIC: #endif
+ */
+int __repmgr_get_incoming_queue_redzone(dbenv, gbytesp, bytesp)
+	DB_ENV *dbenv;
+	u_int32_t *gbytesp, *bytesp;
+{
+	COMPQUIET(gbytesp, NULL);
+	COMPQUIET(bytesp, NULL);
+	return (__db_norepmgr(dbenv));
+}
+
+/*
+ * PUBLIC: #ifndef HAVE_REPLICATION_THREADS
+ * PUBLIC: int __repmgr_get_incoming_queue_fullevent __P((DB_ENV *,
+ * PUBLIC:     int *));
+ * PUBLIC: #endif
+ */
+int __repmgr_get_incoming_queue_fullevent(dbenv, onoffp)
+	DB_ENV *dbenv;
+	int *onoffp;
+{
+	COMPQUIET(onoffp, NULL);
+	return (__db_norepmgr(dbenv));
+}
+
+/*
+ * PUBLIC: #ifndef HAVE_REPLICATION_THREADS
  * PUBLIC: int __repmgr_site
  * PUBLIC:     __P((DB_ENV *, const char *, u_int, DB_SITE **, u_int32_t));
  * PUBLIC: #endif
@@ -125,11 +188,12 @@ __repmgr_local_site(dbenv, dbsitep)
 
 /*
  * PUBLIC: #ifndef HAVE_REPLICATION_THREADS
- * PUBLIC: int __repmgr_site_list __P((DB_ENV *, u_int *, DB_REPMGR_SITE **));
+ * PUBLIC: int __repmgr_site_list_pp
+ * PUBLIC:	__P((DB_ENV *, u_int *, DB_REPMGR_SITE **));
  * PUBLIC: #endif
  */
 int
-__repmgr_site_list(dbenv, countp, listp)
+__repmgr_site_list_pp(dbenv, countp, listp)
 	DB_ENV *dbenv;
 	u_int *countp;
 	DB_REPMGR_SITE **listp;
@@ -141,11 +205,11 @@ __repmgr_site_list(dbenv, countp, listp)
 
 /*
  * PUBLIC: #ifndef HAVE_REPLICATION_THREADS
- * PUBLIC: int __repmgr_start __P((DB_ENV *, int, u_int32_t));
+ * PUBLIC: int __repmgr_start_pp __P((DB_ENV *, int, u_int32_t));
  * PUBLIC: #endif
  */
 int
-__repmgr_start(dbenv, nthreads, flags)
+__repmgr_start_pp(dbenv, nthreads, flags)
 	DB_ENV *dbenv;
 	int nthreads;
 	u_int32_t flags;
@@ -258,5 +322,37 @@ __repmgr_init_recover(env, dtabp)
 	COMPQUIET(env, NULL);
 	COMPQUIET(dtabp, NULL);
 	return (0);
+}
+
+/*
+ * PUBLIC: #ifndef HAVE_REPLICATION_THREADS
+ * PUBLIC: int __repmgr_set_socket __P((DB_ENV *,
+ * PUBLIC:     int (*)(DB_ENV *, DB_REPMGR_SOCKET, int *, u_int32_t)));
+ * PUBLIC: #endif
+ */
+int
+__repmgr_set_socket(dbenv, f_approval)
+	DB_ENV *dbenv;
+	int (*f_approval) __P((DB_ENV *, DB_REPMGR_SOCKET, int *, u_int32_t));
+{
+	COMPQUIET(f_approval, NULL);
+	return (__db_norepmgr(dbenv));
+}
+
+/*
+ * PUBLIC: #ifndef HAVE_REPLICATION_THREADS
+ * PUBLIC: int __repmgr_set_ssl_config_pp __P((DB_ENV *, int, char *value));
+ * PUBLIC: #endif
+ */
+int
+__repmgr_set_ssl_config_pp(dbenv, config_field, value)
+	DB_ENV *dbenv;
+	int config_field;
+	char *value;
+{
+	COMPQUIET(dbenv, NULL);
+	COMPQUIET(config_field, 0);
+	COMPQUIET(value, NULL);
+	return (__db_norepmgr(dbenv));
 }
 #endif /* !HAVE_REPLICATION_THREADS */

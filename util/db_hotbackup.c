@@ -1,7 +1,7 @@
 /*-
- * See the file LICENSE for redistribution information.
+ * Copyright (c) 1996, 2020 Oracle and/or its affiliates.  All rights reserved.
  *
- * Copyright (c) 1996, 2012 Oracle and/or its affiliates.  All rights reserved.
+ * See the file LICENSE for license information.
  *
  * $Id$
  */
@@ -15,26 +15,53 @@
 
 #ifndef lint
 static const char copyright[] =
-    "Copyright (c) 1996, 2012 Oracle and/or its affiliates.  All rights reserved.\n";
+    "Copyright (c) 1996, 2020 Oracle and/or its affiliates.  All rights reserved.\n";
 #endif
 
 enum which_open { OPEN_ORIGINAL, OPEN_HOT_BACKUP };
 
 int env_init __P((DB_ENV **,
-     char *, char **, char ***, char *, enum which_open, int));
+     char *, char *, char **, char ***, char *, char *, enum which_open, int));
 int main __P((int, char *[]));
 int usage __P((void));
-int version_check __P((void));
-void __db_util_msg __P((const DB_ENV *, const char *));
+void handle_event __P((DB_ENV *, u_int32_t, void *));
 
 const char *progname;
+/*
+ * Hot backup returns DB_EXIT_FAILCHK (3) if it detects that a panic was due to
+ * another process having crashed or exited from the environment uncleanly. That
+ * value can be used to indicate that the error is "expected", or at least, not
+ * due to a problem with db_hotbackup itself.
+ */
+int failchk_count;
 
-void __db_util_msg(dbenv, msgstr)
-	const DB_ENV *dbenv;
-	const char *msgstr;
+void handle_event(dbenv, event, info)
+	DB_ENV *dbenv;
+	u_int32_t event;
+	void *info;
 {
+	DB_EVENT_MUTEX_DIED_INFO *mtxdied;
+	DB_EVENT_FAILCHK_INFO *crash;
+
+	switch (event) {
+	case DB_EVENT_MUTEX_DIED:
+		mtxdied = info;
+		dbenv->errx(dbenv, "DB_EVENT_MUTEX_DIED %.*s",
+		    sizeof(mtxdied->desc), mtxdied->desc);
+		failchk_count++;
+		break;
+
+	case DB_EVENT_FAILCHK_PANIC:
+		crash = info;
+		dbenv->errx(dbenv, "DB_EVENT_FAILCHK_PANIC %s %.*s",
+		    db_strerror(crash->error),
+		    sizeof(crash->symptom), crash->symptom);
+		failchk_count++;
+		break;
+	default:
+		break;
+	}
 	COMPQUIET(dbenv, NULL);
-	printf("%s: %s\n", progname, msgstr);
 }
 
 int
@@ -47,9 +74,10 @@ main(argc, argv)
 	time_t now;
 	DB_ENV *dbenv;
 	u_int data_cnt, data_next;
-	int ch, checkpoint, db_config, debug, env_copy, exitval;
+	int ch, checkpoint, db_config, debug, deep_copy, env_copy, exitval;
 	int ret, update, verbose;
-	char *backup_dir, **data_dir, *home, *log_dir, *passwd;
+	char *backup_dir, **data_dir;
+	char *home, *home_blob_dir, *log_dir, *msgpfx, *passwd;
 	char home_buf[DB_MAXPATHLEN], time_buf[CTIME_BUFLEN];
 	u_int32_t flags;
 
@@ -63,28 +91,29 @@ main(argc, argv)
 	 * don't want to care about.  There isn't enough output for the calls
 	 * to matter.
 	 */
-	setbuf(stdout, NULL);
+	(void)setvbuf(stdout, NULL, _IONBF, 0);
 
-	if ((progname = __db_rpath(argv[0])) == NULL)
-		progname = argv[0];
-	else
-		++progname;
+	progname = __db_util_arg_progname(argv[0]);
+	failchk_count = 0;
 
-	if ((ret = version_check()) != 0)
+	if ((ret = __db_util_version_check(progname)) != 0)
 		return (ret);
 
 	/* We default to the safe environment copy. */
 	env_copy = 1;
 
 	checkpoint = db_config = data_cnt = data_next = debug = 
-	    exitval = update = verbose = 0;
+	    deep_copy = exitval = update = verbose = 0;
 	data_dir = NULL;
-	backup_dir = home = passwd = NULL;
+	backup_dir = home = home_blob_dir = msgpfx = passwd = NULL;
 	log_dir = NULL;
-	while ((ch = getopt(argc, argv, "b:cDd:Fgh:l:P:uVv")) != EOF)
+	while ((ch = getopt(argc, argv, "b:CcDd:Fgh:i:l:m:P:uVv")) != EOF)
 		switch (ch) {
 		case 'b':
 			backup_dir = optarg;
+			break;
+		case 'C':
+			deep_copy = 1;
 			break;
 		case 'c':
 			checkpoint = 1;
@@ -119,23 +148,18 @@ main(argc, argv)
 		case 'h':
 			home = optarg;
 			break;
+		case 'i':
+			home_blob_dir = optarg;
+			break;
 		case 'l':
 			log_dir = optarg;
 			break;
+		case 'm':
+			msgpfx = optarg;
+			break;
 		case 'P':
-			if (passwd != NULL) {
-				fprintf(stderr, "%s: %s", progname,
-				    DB_STR("5133",
-				    "Password may not be specified twice\n"));
-				free(passwd);
-				return (EXIT_FAILURE);
-			}
-			passwd = strdup(optarg);
-			memset(optarg, 0, strlen(optarg));
-			if (passwd == NULL) {
-				fprintf(stderr, "%s: ", progname);
-				fprintf(stderr, DB_STR_A("5026",
-				    "strdup: %s\n", "%s\n"), strerror(errno));
+			if (__db_util_arg_password(progname, 
+			    optarg, &passwd) != 0) {
 				exitval = (EXIT_FAILURE);
 				goto clean;
 			}
@@ -220,8 +244,7 @@ main(argc, argv)
 	}
 	if (backup_dir == NULL) {
 		fprintf(stderr, "%s: %s", DB_STR("5031",
-		    "no target backup directory specified\n"),
-		    progname);
+		    "no target backup directory specified\n"), progname);
 		exitval = usage();
 		goto clean;
 	}
@@ -234,17 +257,17 @@ main(argc, argv)
 	}
 
 	/* Open the source environment. */
-	if (env_init(&dbenv, home,
+	if (env_init(&dbenv, home, home_blob_dir,
 	     (db_config || log_dir != NULL) ? &log_dir : NULL,
-	     &data_dir, passwd, OPEN_ORIGINAL, verbose) != 0)
+	     &data_dir, msgpfx, passwd, OPEN_ORIGINAL, verbose) != 0)
 		goto err;
 	
 	if (env_copy) {
 		if ((ret = dbenv->get_open_flags(dbenv, &flags)) != 0)
 			goto err;
 		if (flags & DB_PRIVATE) {
-			fprintf(stderr, "%s: %s", progname,  DB_STR("5129",
-			    "Cannot copy data from a PRIVATE environment\n"));
+			fprintf(stderr, "%s: %s", progname,  DB_STR("5140",
+"The environment does not exist or cannot be opened. \"-F\" is required.\n"));
 			goto err;
 		}
 	}
@@ -252,8 +275,7 @@ main(argc, argv)
 	if (log_dir != NULL) {
 		if (db_config && __os_abspath(log_dir)) {
 			fprintf(stderr, "%s: %s", progname, DB_STR("5033",
-			    "DB_CONFIG must not contain an absolute "
-			    "path for the log directory\n"));
+	"DB_CONFIG must not contain an absolute path for the log directory\n"));
 			goto err;
 		}
 	}
@@ -291,6 +313,8 @@ main(argc, argv)
 	flags = DB_CREATE | DB_BACKUP_CLEAN | DB_BACKUP_FILES;
 	if (update)
 		LF_SET(DB_BACKUP_UPDATE);
+	if (deep_copy) 
+		LF_SET(DB_BACKUP_DEEP_COPY);
 
 	if (!db_config)
 		LF_SET(DB_BACKUP_SINGLE_DIR);
@@ -310,8 +334,8 @@ main(argc, argv)
 		printf(DB_STR_A("5040", "%s: run catastrophic recovery\n",
 		    "%s"), backup_dir);
 	}
-	if (env_init(&dbenv,
-	    backup_dir, NULL, NULL, passwd, OPEN_HOT_BACKUP, verbose) != 0)
+	if (env_init(&dbenv, backup_dir, NULL,
+	    NULL, NULL, msgpfx, passwd, OPEN_HOT_BACKUP, verbose) != 0)
 		goto err;
 
 	/*
@@ -321,7 +345,7 @@ main(argc, argv)
 	if (debug == 0) {
 		if (verbose) {
 			printf("%s: ", progname);
-			printf(DB_STR_A("5041",
+			printf(DB_STR_A("5036",
 			    "%s: remove unnecessary log files\n",
 			    "%s"), backup_dir);
 		}
@@ -337,7 +361,7 @@ main(argc, argv)
 err:		exitval = 1;
 	}
 
-	if (dbenv != NULL && (ret = dbenv->close(dbenv, 0)) != 0) {
+	if (dbenv != NULL && ret == 0 && (ret = dbenv->close(dbenv, 0)) != 0) {
 		exitval = 1;
 		fprintf(stderr,
 		    "%s: dbenv->close: %s\n", progname, db_strerror(ret));
@@ -365,7 +389,8 @@ clean:
 	if (passwd != NULL)
 		free(passwd);
 
-	return (exitval == 0 ? EXIT_SUCCESS : EXIT_FAILURE);
+	return (failchk_count != 0 ? DB_EXIT_FAILCHK :
+	    exitval == 0 ? EXIT_SUCCESS : EXIT_FAILURE);
 }
 
 /*
@@ -373,9 +398,9 @@ clean:
  *	Open a database environment.
  */
 int
-env_init(dbenvp, home, log_dirp, data_dirp, passwd, which, verbose)
+env_init(dbenvp, home, blob_dir, log_dirp, data_dirp, msgpfx, passwd, which, verbose)
 	DB_ENV **dbenvp;
-	char *home, **log_dirp, ***data_dirp, *passwd;
+	char *home, *blob_dir, **log_dirp, ***data_dirp, *msgpfx, *passwd;
 	enum which_open which;
 	int verbose;
 {
@@ -386,26 +411,36 @@ env_init(dbenvp, home, log_dirp, data_dirp, passwd, which, verbose)
 
 	*dbenvp = NULL;
 
-	/*
-	 * Create an environment object and initialize it for error reporting.
-	 */
-	if ((ret = db_env_create(&dbenv, 0)) != 0) {
-		fprintf(stderr,
-		    "%s: db_env_create: %s\n", progname, db_strerror(ret));
+
+	if (__db_util_env_create(&dbenv, progname, passwd, msgpfx) != 0)
+		return (1);
+	(void)setvbuf(stderr, NULL, _IONBF, 0);
+
+	if ((ret = dbenv->set_event_notify(dbenv, handle_event)) != 0) {
+		fprintf(stderr, "%s: DB_ENV->set_event_notify: %s\n",
+		    progname, db_strerror(ret));
 		return (1);
 	}
-
 	if (verbose) {
 		(void)dbenv->set_verbose(dbenv, DB_VERB_BACKUP, 1);
-		dbenv->set_msgcall(dbenv, __db_util_msg);
 	}
-	dbenv->set_errfile(dbenv, stderr);
-	setbuf(stderr, NULL);
-	dbenv->set_errpfx(dbenv, progname);
+
+	/* Always enable logging blobs. */
+	if ((ret = dbenv->log_set_config(dbenv, DB_LOG_BLOB, 1)) != 0) {
+		dbenv->err(dbenv, ret, "DB_ENV->log_set_config");
+		return (1);
+	}
 
 	/* Any created intermediate directories are created private. */
 	if ((ret = dbenv->set_intermediate_dir_mode(dbenv, "rwx------")) != 0) {
 		dbenv->err(dbenv, ret, "DB_ENV->set_intermediate_dir_mode");
+		return (1);
+	}
+
+	/* Set the blob directory. */
+	if (blob_dir != NULL &&
+	    (ret = dbenv->set_blob_dir(dbenv, blob_dir)) != 0) {
+		dbenv->err(dbenv, ret, "DB_ENV->set_blob-dir");
 		return (1);
 	}
 
@@ -416,13 +451,6 @@ env_init(dbenvp, home, log_dirp, data_dirp, passwd, which, verbose)
 	if (log_dirp != NULL && *log_dirp != NULL &&
 	    (ret = dbenv->set_lg_dir(dbenv, *log_dirp)) != 0) {
 		dbenv->err(dbenv, ret, "DB_ENV->set_lg_dir: %s", *log_dirp);
-		return (1);
-	}
-
-	/* Optionally set the password. */
-	if (passwd != NULL &&
-	    (ret = dbenv->set_encrypt(dbenv, passwd, DB_ENCRYPT_AES)) != 0) {
-		dbenv->err(dbenv, ret, "DB_ENV->set_encrypt");
 		return (1);
 	}
 
@@ -437,7 +465,8 @@ env_init(dbenvp, home, log_dirp, data_dirp, passwd, which, verbose)
 			 * trim the home directory from the data directory
 			 * passed in.
 			 */
-			(void) sprintf(buf, "%s/%s", home, home);
+			(void) snprintf(buf, sizeof(buf), "%s/%s", 
+			    home, home);
 			homehome = 0;
 			(void)__os_exists(dbenv->env, buf, &homehome);
 				
@@ -454,7 +483,7 @@ env_init(dbenvp, home, log_dirp, data_dirp, passwd, which, verbose)
 						(*data_dir) += strlen(home);
 				}
 
-			    	if ((ret = dbenv->add_data_dir(
+				if ((ret = dbenv->add_data_dir(
 				    dbenv, *data_dir)) != 0) {
 					dbenv->err(dbenv, ret,
 					    "DB_ENV->add_data_dir: %s",
@@ -464,18 +493,25 @@ env_init(dbenvp, home, log_dirp, data_dirp, passwd, which, verbose)
 			}
 		}
 		/*
+		 * Turn on DB_THREAD in case a repmgr application uses the -c
+		 * option of this utility: repmgr requires DB_THREAD
+		 * for all env handles.
+		 */
+#ifdef HAVE_REPLICATION_THREADS
+#define	ENV_FLAGS DB_THREAD
+#else
+#define	ENV_FLAGS 0
+#endif
+		/*
 		 * Opening the database environment we're trying to back up.
 		 * We try to attach to a pre-existing environment; if that
 		 * fails, we create a private environment and try again.
 		 */
-		if ((ret = dbenv->open(dbenv, home, DB_USE_ENVIRON, 0)) != 0 &&
-		    (ret == DB_VERSION_MISMATCH ||
-		    (ret = dbenv->open(dbenv, home, DB_CREATE |
-		    DB_INIT_LOG | DB_INIT_TXN | DB_PRIVATE | DB_USE_ENVIRON,
-		    0)) != 0)) {
-			dbenv->err(dbenv, ret, "DB_ENV->open: %s", home);
+		if (__db_util_env_open(dbenv, home, ENV_FLAGS,
+		    1, DB_INIT_LOG | DB_INIT_MPOOL | DB_INIT_TXN | ENV_FLAGS, 0,
+		    NULL) != 0)
 			return (1);
-		}
+
 		if (log_dirp != NULL) {
 			(void)dbenv->get_lg_dir(dbenv, &log_dir);
 			if (*log_dirp == NULL)
@@ -486,9 +522,19 @@ env_init(dbenvp, home, log_dirp, data_dirp, passwd, which, verbose)
 				    "%s\n"), progname);
 				return (usage());
 			} else {
-				fprintf(stderr, "%s: %s", DB_STR("5058",
+				/* 
+				 * Do we have -l and an existing DB_CONFIG? 
+				 * That is a usage problem, but for backward
+				 * compatibility, keep going if log_dir happens
+				 * to be the same as the DB_CONFIG path.
+				 */
+				(void)snprintf(buf, sizeof(buf), "%s%c%s", 
+				    home, PATH_SEPARATOR[0], "DB_CONFIG");
+				if (__os_exists(dbenv->env, buf, NULL) == 0)
+					fprintf(stderr, 
+					    "%s: %s", DB_STR("5141",
 			    "use of -l with DB_CONFIG file is deprecated\n"),
-				    progname);
+					    progname);
 			}
 		}
 		if (data_dirp != NULL && *data_dirp == NULL)
@@ -526,26 +572,8 @@ env_init(dbenvp, home, log_dirp, data_dirp, passwd, which, verbose)
 int
 usage()
 {
-	(void)fprintf(stderr, "usage: %s [-cDuVv]\n\t%s\n", progname,
-    "[-d data_dir ...] [-h home] [-l log_dir] [-P password] -b backup_dir");
+	(void)fprintf(stderr, "usage: %s [-cCDuVv]\n\t%s\n", progname,
+	    "[-d data_dir ...] [-i home_blob_dir] [-h home] [-l log_dir] "
+	    "[-m msg_pfx] [-P password] -b backup_dir");
 	return (EXIT_FAILURE);
-}
-
-int
-version_check()
-{
-	int v_major, v_minor, v_patch;
-
-	/* Make sure we're loaded with the right version of the DB library. */
-	(void)db_version(&v_major, &v_minor, &v_patch);
-	if (v_major != DB_VERSION_MAJOR || v_minor != DB_VERSION_MINOR) {
-		fprintf(stderr, "%s: ", progname);
-		fprintf(stderr, DB_STR_A("5071",
-		    "version %d.%d doesn't match library version %d.%d\n",
-		    "%d %d %d %d\n"),
-		    DB_VERSION_MAJOR, DB_VERSION_MINOR,
-		    v_major, v_minor);
-		return (EXIT_FAILURE);
-	}
-	return (0);
 }

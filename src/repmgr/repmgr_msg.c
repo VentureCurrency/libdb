@@ -1,7 +1,7 @@
 /*-
- * See the file LICENSE for redistribution information.
+ * Copyright (c) 2005, 2020 Oracle and/or its affiliates.  All rights reserved.
  *
- * Copyright (c) 2005, 2012 Oracle and/or its affiliates.  All rights reserved.
+ * See the file LICENSE for license information.
  *
  * $Id$
  */
@@ -15,27 +15,35 @@
 #include "dbinc_auto/repmgr_auto.h"
 
 static int dispatch_app_message __P((ENV *, REPMGR_MESSAGE *));
-static int finish_gmdb_update __P((ENV *,
-	DB_THREAD_INFO *, DBT *, u_int32_t, u_int32_t, __repmgr_member_args *));
+static int finish_gmdb_update __P((ENV *, DB_THREAD_INFO *,
+    DBT *, u_int32_t, u_int32_t, u_int32_t, __repmgr_member_args *));
 static int incr_gm_version __P((ENV *, DB_THREAD_INFO *, DB_TXN *));
-static void marshal_site_data __P((ENV *, u_int32_t, u_int8_t *, DBT *));
+static void marshal_site_data __P((ENV *,
+    u_int32_t, u_int32_t, u_int8_t *, DBT *));
 static void marshal_site_key __P((ENV *,
 	repmgr_netaddr_t *, u_int8_t *, DBT *, __repmgr_member_args *));
 static int message_loop __P((ENV *, REPMGR_RUNNABLE *));
+static int preferred_master_takeover __P((ENV*));
 static int process_message __P((ENV*, DBT*, DBT*, int));
 static int reject_fwd __P((ENV *, REPMGR_CONNECTION *));
+static int rejoin_connections(ENV *);
+static int rejoin_deferred_election(ENV *);
 static int rescind_pending __P((ENV *,
 	DB_THREAD_INFO *, int, u_int32_t, u_int32_t));
 static int resolve_limbo_int __P((ENV *, DB_THREAD_INFO *));
 static int resolve_limbo_wrapper __P((ENV *, DB_THREAD_INFO *));
 static int send_permlsn __P((ENV *, u_int32_t, DB_LSN *));
 static int send_permlsn_conn __P((ENV *,
-	REPMGR_CONNECTION *, u_int32_t, DB_LSN *));
+	REPMGR_CONNECTION *, u_int32_t, DB_LSN *, DB_LSN *));
 static int serve_join_request __P((ENV *,
 	DB_THREAD_INFO *, REPMGR_MESSAGE *));
+static int serve_lsnhist_request __P((ENV *, DB_THREAD_INFO *,
+	REPMGR_MESSAGE *));
+static int serve_readonly_master_request __P((ENV *, REPMGR_MESSAGE *));
 static int serve_remove_request __P((ENV *,
 	DB_THREAD_INFO *, REPMGR_MESSAGE *));
 static int serve_repmgr_request __P((ENV *, REPMGR_MESSAGE *));
+static int serve_restart_client_request __P((ENV *, REPMGR_MESSAGE *));
 
 /*
  * Map one of the phase-1/provisional membership status values to its
@@ -72,17 +80,19 @@ message_loop(env, th)
 	REPMGR_RUNNABLE *th;
 {
 	DB_REP *db_rep;
+	DB_THREAD_INFO *ip;
 	REP *rep;
 	REPMGR_MESSAGE *msg;
 	REPMGR_CONNECTION *conn;
 	REPMGR_SITE *site;
-	__repmgr_permlsn_args permlsn;
+	__repmgr_heartbeat_args heartbeat;
 	int incremented, ret, t_ret;
 	u_int32_t membership;
 
 	COMPQUIET(membership, 0);
 	db_rep = env->rep_handle;
 	rep = db_rep->region;
+	ENV_ENTER(env, ip);
 	LOCK_MUTEX(db_rep->mutex);
 	while ((ret = __repmgr_queue_get(env, &msg, th)) == 0) {
 		incremented = FALSE;
@@ -129,8 +139,8 @@ message_loop(env, th)
 			ret = serve_repmgr_request(env, msg);
 			break;
 		case REPMGR_HEARTBEAT:
-			if ((ret = __repmgr_permlsn_unmarshal(env,
-			    &permlsn, msg->v.repmsg.control.data,
+			if ((ret = __repmgr_heartbeat_unmarshal(env,
+			    &heartbeat, msg->v.repmsg.control.data,
 			    msg->v.repmsg.control.size, NULL)) != 0)
 				ret = DB_REP_UNAVAIL;
 			else if (rep->master_id == db_rep->self_eid) {
@@ -141,14 +151,28 @@ message_loop(env, th)
 				 * detect it without the need for application
 				 * activity.
 				 */
-				ret = __rep_flush(env->dbenv);
+				ret = __rep_flush_int(env);
+			} else if (db_rep->prefmas_pending == master_switch &&
+			    IS_PREFMAS_MODE(env) &&
+			    FLD_ISSET(rep->config, REP_C_PREFMAS_MASTER) &&
+			    F_ISSET(rep, REP_F_CLIENT)) {
+				RPRINT(env, (env, DB_VERB_REPMGR_MISC,
+"message_loop heartbeat preferred master switch"));
+				/*
+				 * We are a preferred master site currently
+				 * running as a client and we have finished
+				 * syncing with the temporary master.  It is
+				 * now time to take over as master.
+				 */
+				db_rep->prefmas_pending = no_action;
+				ret = preferred_master_takeover(env);
 			} else {
 				/*
 				 * Use heartbeat message to initiate rerequest
 				 * processing.
 				 */
 				ret = __rep_check_missing(env,
-				    permlsn.generation, &permlsn.lsn);
+				    heartbeat.generation, &heartbeat.lsn);
 			}
 			break;
 		default:
@@ -162,6 +186,12 @@ message_loop(env, th)
 			db_rep->non_rep_th--;
 		if (ret != 0)
 			goto out;
+		if (db_rep->view_mismatch) {
+			__db_errx(env, DB_STR("3699",
+    "Site is not recorded as a view in the group membership database"));
+			ret = EINVAL;
+			goto out;
+		}
 	}
 	/*
 	 * A return of DB_REP_UNAVAIL from __repmgr_queue_get() merely means we
@@ -171,6 +201,7 @@ message_loop(env, th)
 		ret = 0;
 out:
 	UNLOCK_MUTEX(db_rep->mutex);
+	ENV_LEAVE(env, ip);
 	return (ret);
 }
 
@@ -244,7 +275,7 @@ dispatch_app_message(env, msg)
 	    DB_REPMGR_NEED_RESPONSE : 0;
 
 	if (db_rep->msg_dispatch == NULL) {
-		__db_errx(env, DB_STR("3670",
+		__db_errx(env, DB_STR("3655",
 	    "No message dispatch call-back function has been configured"));
 		if (F_ISSET(channel.meta, REPMGR_REQUEST_MSG_TYPE))
 			return (__repmgr_send_err_resp(env,
@@ -259,7 +290,7 @@ dispatch_app_message(env, msg)
 
 	if (F_ISSET(channel.meta, REPMGR_REQUEST_MSG_TYPE) &&
 	    !channel.responded) {
-		__db_errx(env, DB_STR("3671",
+		__db_errx(env, DB_STR("3656",
 		    "Application failed to provide a response"));
 		return (__repmgr_send_err_resp(env, &channel, DB_KEYEMPTY));
 	}
@@ -316,6 +347,8 @@ process_message(env, control, rec, eid)
 	int dirty, ret, t_ret;
 	u_int32_t generation;
 
+	/* Any error history from previous messages is not useful; clear it. */
+	DISCARD_HISTORY(env);
 	db_rep = env->rep_handle;
 	rep = db_rep->region;
 
@@ -341,16 +374,45 @@ process_message(env, control, rec, eid)
 		break;
 
 	case DB_REP_DUPMASTER:
-		/*
-		 * Initiate an election if we're configured to be using
-		 * elections, but only if we're *NOT* using leases.  When using
-		 * leases, there is never any uncertainty over which site is the
-		 * rightful master, and only the loser gets the DUPMASTER return
-		 * code.
-		 */
-		if ((ret = __repmgr_become_client(env)) == 0 &&
+		if (IS_PREFMAS_MODE(env) &&
+		    FLD_ISSET(rep->config, REP_C_PREFMAS_MASTER)) {
+			/*
+			 * The preferred master site must restart as a master
+			 * so that it sends out a NEWMASTER to help the client
+			 * sync.  It must force a role change so that it
+			 * advances its gen even though it is already master.
+			 * This is needed if there was a temporary master at
+			 * a higher gen that is now restarting as a client.
+			 * A client won't process messages from a master at
+			 * a lower gen than its own.
+			 */
+			ret = __repmgr_repstart(env, DB_REP_MASTER,
+			    REP_START_FORCE_ROLECHG);
+		} else if (IS_PREFMAS_MODE(env) &&
+		    FLD_ISSET(rep->config, REP_C_PREFMAS_CLIENT) &&
+		    (ret = __repmgr_become_client(env)) == 0) {
+			/*
+			 * The preferred master client site must restart as
+			 * client without any elections to enable the preferred
+			 * master site to preserve its own transactions.  It
+			 * uses an election thread to repeatedly perform client
+			 * startups so that it will perform its client sync
+			 * when the preferred master's gen has caught up.
+			 */
+			LOCK_MUTEX(db_rep->mutex);
+			ret = __repmgr_init_election(env,
+			    ELECT_F_CLIENT_RESTART);
+			UNLOCK_MUTEX(db_rep->mutex);
+		} else if ((ret = __repmgr_become_client(env)) == 0 &&
 		    FLD_ISSET(rep->config, REP_C_LEASE | REP_C_ELECTIONS)
 		    == REP_C_ELECTIONS) {
+			/*
+			 * Initiate an election if we're configured to be using
+			 * elections, but only if we're *NOT* using leases.
+			 * When using leases, there is never any uncertainty
+			 * over which site is the rightful master, and only the
+			 * loser gets the DUPMASTER return code.
+			 */
 			LOCK_MUTEX(db_rep->mutex);
 			ret = __repmgr_init_election(env, ELECT_F_IMMED);
 			UNLOCK_MUTEX(db_rep->mutex);
@@ -406,6 +468,14 @@ DB_TEST_RECOVERY_LABEL
 		t_ret = __op_rep_exit(env);
 		if (ret == ENOENT)
 			ret = 0;
+		else if (ret == DB_DELETED && db_rep->demotion_pending)
+			/*
+			 * If a demotion is in progress, we want to keep
+			 * the repmgr threads instead of bowing out because
+			 * they are needed when we rejoin the replication group
+			 * immediately as a view.
+			 */
+			ret = 0;
 		else if (ret == DB_DELETED)
 			ret = __repmgr_bow_out(env);
 		if (t_ret != 0 && ret == 0)
@@ -428,8 +498,10 @@ __repmgr_handle_event(env, event, info)
 	void *info;
 {
 	DB_REP *db_rep;
+	REP *rep;
 
 	db_rep = env->rep_handle;
+	rep = db_rep->region;
 
 	if (db_rep->selector == NULL) {
 		/* Repmgr is not in use, so all events go to application. */
@@ -450,16 +522,62 @@ __repmgr_handle_event(env, event, info)
 		 */
 		break;
 	case DB_EVENT_REP_INIT_DONE:
-		db_rep->gmdb_dirty = TRUE;
+		/*
+		 * An abbreviated internal init doesn't change the gmdb, so
+		 * don't mark it dirty in this case.  A dirty gmdb will be
+		 * reloaded, which causes problems in some mixed-version
+		 * cases when the gmdb needs conversion.
+		 */
+		if (db_rep->abbrev_init)
+			db_rep->abbrev_init = FALSE;
+		else
+			db_rep->gmdb_dirty = TRUE;
 		break;
 	case DB_EVENT_REP_NEWMASTER:
 		DB_ASSERT(env, info != NULL);
 
 		/* Application still needs to see this. */
 		break;
+	case DB_EVENT_REP_MASTER:
+	case DB_EVENT_REP_STARTUPDONE:
+		/*
+		 * Detect a rare case where a dupmaster or incomplete gmdb
+		 * operation has left the site's gmdb inconsistent with
+		 * a view callback definition.  The user would have correctly
+		 * defined a view callback and called repmgr_start(), but the
+		 * gmdb operation to update this site to a view would have been
+		 * incomplete or rolled back.  The site cannot operate in this
+		 * inconsistent state, so set an indicator to cause a message
+		 * thread to panic and terminate.
+		 *
+		 * The one exception is during a demotion to view, when
+		 * this inconsistency is expected for a short time.
+		 */
+		if (IS_VALID_EID(db_rep->self_eid) &&
+		    PARTICIPANT_TO_VIEW(db_rep,
+		    SITE_FROM_EID(db_rep->self_eid)) &&
+		    !db_rep->demotion_pending)
+			db_rep->view_mismatch = TRUE;
+
+		/*
+		 * In preferred master mode, when the preferred master site
+		 * finishes synchronizing with the temporary master it must
+		 * prepare to take over as master.  This is detected by the
+		 * next heartbeat in a message thread, where the takeover is
+		 * actually performed.
+		 */
+		if (event == DB_EVENT_REP_STARTUPDONE &&
+		    IS_PREFMAS_MODE(env) &&
+		    FLD_ISSET(rep->config, REP_C_PREFMAS_MASTER)) {
+			RPRINT(env, (env, DB_VERB_REPMGR_MISC,
+			    "startupdone set preferred master switch"));
+			db_rep->prefmas_pending = master_switch;
+		}
+		break;
 	default:
 		break;
 	}
+	COMPQUIET(info, NULL);
 	return (DB_EVENT_NOT_HANDLED);
 }
 
@@ -469,6 +587,7 @@ send_permlsn(env, generation, lsn)
 	u_int32_t generation;
 	DB_LSN *lsn;
 {
+	DB_LSN ckp_lsn;
 	DB_REP *db_rep;
 	REP *rep;
 	REPMGR_CONNECTION *conn;
@@ -479,6 +598,14 @@ send_permlsn(env, generation, lsn)
 	rep = db_rep->region;
 	ret = 0;
 	master = rep->master_id;
+#ifdef HAVE_REPLICATION_THREADS
+	REP_SYSTEM_LOCK(env);
+	ckp_lsn = rep->last_ckp_lsn;
+	REP_SYSTEM_UNLOCK(env);
+#else
+	ZERO_LSN(ckp_lsn);
+#endif
+
 	LOCK_MUTEX(db_rep->mutex);
 
 	/*
@@ -504,7 +631,7 @@ send_permlsn(env, generation, lsn)
 		 */
 		policy = site->ack_policy > 0 ?
 		    site->ack_policy : rep->perm_policy;
-		if (policy == DB_REPMGR_ACKS_NONE ||
+		if (IS_VIEW_SITE(env) || policy == DB_REPMGR_ACKS_NONE ||
 		    (IS_PEER_POLICY(policy) && rep->priority == 0))
 			ack = FALSE;
 		else
@@ -524,17 +651,17 @@ send_permlsn(env, generation, lsn)
 			if ((conn = site->ref.conn.in) != NULL &&
 			    conn->state == CONN_READY &&
 			    (ret = send_permlsn_conn(env,
-			    conn, generation, lsn)) != 0)
+			    conn, generation, lsn, &ckp_lsn)) != 0)
 				goto unlock;
 			if ((conn = site->ref.conn.out) != NULL &&
 			    conn->state == CONN_READY &&
 			    (ret = send_permlsn_conn(env,
-			    conn, generation, lsn)) != 0)
+			    conn, generation, lsn, &ckp_lsn)) != 0)
 				goto unlock;
 		}
 		TAILQ_FOREACH(conn, &site->sub_conns, entries) {
 			if ((ret = send_permlsn_conn(env,
-			    conn, generation, lsn)) != 0)
+			    conn, generation, lsn, &ckp_lsn)) != 0)
 				goto unlock;
 		}
 	}
@@ -554,12 +681,12 @@ send_permlsn(env, generation, lsn)
 				if ((conn = site->ref.conn.in) != NULL &&
 				    conn->state == CONN_READY &&
 				    (ret = send_permlsn_conn(env,
-				    conn, generation, lsn)) != 0)
+				    conn, generation, lsn, &ckp_lsn)) != 0)
 					goto unlock;
 				if ((conn = site->ref.conn.out) != NULL &&
 				    conn->state == CONN_READY &&
 				    (ret = send_permlsn_conn(env,
-				    conn, generation, lsn)) != 0)
+				    conn, generation, lsn, &ckp_lsn)) != 0)
 					goto unlock;
 			}
 		}
@@ -576,14 +703,17 @@ unlock:
  * !!! Called with mutex held.
  */
 static int
-send_permlsn_conn(env, conn, generation, lsn)
+send_permlsn_conn(env, conn, generation, lsn, ckp_lsn)
 	ENV *env;
 	REPMGR_CONNECTION *conn;
 	u_int32_t generation;
 	DB_LSN *lsn;
+	DB_LSN *ckp_lsn;
 {
 	DBT control2, rec2;
+	__repmgr_v6permlsn_args v6permlsn;
 	__repmgr_permlsn_args permlsn;
+	u_int8_t v6buf[__REPMGR_V6PERMLSN_SIZE];
 	u_int8_t buf[__REPMGR_PERMLSN_SIZE];
 	int ret;
 
@@ -591,12 +721,16 @@ send_permlsn_conn(env, conn, generation, lsn)
 
 	if (conn->state == CONN_READY) {
 		DB_ASSERT(env, conn->version > 0);
-		permlsn.generation = generation;
-		memcpy(&permlsn.lsn, lsn, sizeof(DB_LSN));
-		if (conn->version == 1) {
-			control2.data = &permlsn;
-			control2.size = sizeof(permlsn);
+		if (conn->version < 7) {
+			v6permlsn.generation = generation;
+			memcpy(&v6permlsn.lsn, lsn, sizeof(DB_LSN));
+			__repmgr_v6permlsn_marshal(env, &v6permlsn, v6buf);
+			control2.data = v6buf;
+			control2.size = __REPMGR_V6PERMLSN_SIZE;
 		} else {
+			permlsn.generation = generation;
+			memcpy(&permlsn.lsn, lsn, sizeof(DB_LSN));
+			memcpy(&permlsn.last_ckp_lsn, ckp_lsn, sizeof(DB_LSN));
 			__repmgr_permlsn_marshal(env, &permlsn, buf);
 			control2.data = buf;
 			control2.size = __REPMGR_PERMLSN_SIZE;
@@ -614,26 +748,149 @@ send_permlsn_conn(env, conn, generation, lsn)
 	return (ret);
 }
 
+/*
+ * Perform the steps on the preferred master site to take over again as
+ * preferred master from a temporary master.  This routine should only be
+ * called after the preferred master has restarted as a client and finished
+ * a client sync with the temporary master.
+ *
+ * This routine makes a best effort to wait until all temporary master
+ * transactions have been applied on this site before taking over.
+ */
+static int
+preferred_master_takeover(env)
+	ENV *env;
+{
+	DB_LOG *dblp;
+	DB_REP *db_rep;
+	LOG *lp;
+	REP *rep;
+	DB_LSN last_ready_lsn, ready_lsn, sync_lsn;
+	u_long usec;
+	u_int32_t gen, max_tries, tries;
+	int ret, synced;
+
+	dblp = env->lg_handle;
+	lp = dblp->reginfo.primary;
+	db_rep = env->rep_handle;
+	rep = db_rep->region;
+	gen = 0;
+	ZERO_LSN(sync_lsn);
+	ret = 0;
+
+	if (!IS_PREFMAS_MODE(env))
+		return (ret);
+
+	/*
+	 * Start by making the temporary master a readonly master so that we
+	 * can know when we have applied all of its transactions on this
+	 * site before taking over.
+	 */
+	if ((ret = __repmgr_make_site_readonly_master(env,
+	    1, &gen, &sync_lsn)) != 0)
+		return (ret);
+	DB_ASSERT(env, gen >= rep->gen);
+
+	/*
+	 * Make a best effort to wait until this site has all transactions
+	 * from the temporary master.  We want to preserve temporary master
+	 * transactions, but we can't wait forever.  If we exceed our wait,
+	 * we restart this site as preferred master anyway.  This may
+	 * sacrifice some temporary master transactions in order to preserve
+	 * repgroup write availability.
+	 *
+	 * We restart the number of tries each time we make progress in
+	 * transactions applied, until either we apply through sync_lsn or
+	 * we exceed max_tries without progress.
+	 */
+	if ((ret = __repmgr_prefmas_get_wait(env, &max_tries, &usec)) != 0)
+		return (ret);
+	tries = 0;
+	synced = 0;
+	ZERO_LSN(ready_lsn);
+	ZERO_LSN(last_ready_lsn);
+	while (!synced && tries < max_tries) {
+		__os_yield(env, 0, usec);
+		tries++;
+		/*
+		 * lp->ready_lsn is the next LSN we expect to receive,
+		 * which also indicates how much we've applied.  sync_lsn
+		 * is the lp->lsn (indicating the next log record expected)
+		 * from the other site.
+		 */
+		MUTEX_LOCK(env, rep->mtx_clientdb);
+		ready_lsn = lp->ready_lsn;
+		MUTEX_UNLOCK(env, rep->mtx_clientdb);
+		if (gen == rep->gen && LOG_COMPARE(&ready_lsn, &sync_lsn) >= 0)
+			synced = 1;
+		else if (LOG_COMPARE(&ready_lsn, &last_ready_lsn) >= 0) {
+			/* We are making progress, restart number of tries. */
+			last_ready_lsn = ready_lsn;
+			tries = 0;
+		}
+	}
+
+	/* Restart the remote readonly temporary master as a client. */
+	if ((ret = __repmgr_restart_site_as_client(env, 1)) != 0)
+		return (ret);
+
+	/* Restart this site as the preferred master, waiting for
+	 * REP_LOCKOUT_MSG.  The NEWCLIENT message sent back from
+	 * restarting the other site as client can briefly lock
+	 * REP_LOCKOUT_MSG to do some cleanup.  We don't want this
+	 * to cause the rep_start_int() call to restart this site
+	 * as master to return 0 without doing anything.
+	 */
+	ret = __repmgr_become_master(env, REP_START_WAIT_LOCKMSG);
+	return (ret);
+}
+
 static int
 serve_repmgr_request(env, msg)
 	ENV *env;
 	REPMGR_MESSAGE *msg;
 {
-	DB_THREAD_INFO *ip;
+	DB_REP *db_rep;
 	DBT *dbt;
+	DB_THREAD_INFO *ip;
 	REPMGR_CONNECTION *conn;
+	u_int32_t mtype;
 	int ret, t_ret;
 
-	ENV_ENTER(env, ip);
-	switch (REPMGR_OWN_MSG_TYPE(msg->msg_hdr)) {
+	db_rep = env->rep_handle;
+	ENV_GET_THREAD_INFO(env, ip);
+	conn = msg->v.gmdb_msg.conn;
+	mtype = REPMGR_OWN_MSG_TYPE(msg->msg_hdr);
+	switch (mtype) {
 	case REPMGR_JOIN_REQUEST:
 		ret = serve_join_request(env, ip, msg);
+		break;
+	case REPMGR_LSNHIST_REQUEST:
+		ret = serve_lsnhist_request(env, ip, msg);
+		break;
+	case REPMGR_READONLY_MASTER:
+		ret = serve_readonly_master_request(env, msg);
 		break;
 	case REPMGR_REJOIN:
 		RPRINT(env, (env, DB_VERB_REPMGR_MISC,
 		    "One try at rejoining group automatically"));
 		if ((ret = __repmgr_join_group(env)) == DB_REP_UNAVAIL)
 			ret = __repmgr_bow_out(env);
+		else if (ret == 0 && IS_PREFMAS_MODE(env)) {
+			/*
+			 * For preferred master mode, we need to get
+			 * a "regular" connection to the other site without
+			 * calling an election prematurely here.
+			 */
+			RPRINT(env, (env, DB_VERB_REPMGR_MISC,
+			    "Establishing connections after rejoin"));
+			ret = rejoin_connections(env);
+		} else if (ret == 0 && db_rep->rejoin_pending) {
+			RPRINT(env, (env, DB_VERB_REPMGR_MISC,
+			    "Calling deferred election after rejoin"));
+			ret = rejoin_deferred_election(env);
+		}
+		db_rep->rejoin_pending = FALSE;
 		break;
 	case REPMGR_REMOVE_REQUEST:
 		ret = serve_remove_request(env, ip, msg);
@@ -641,23 +898,32 @@ serve_repmgr_request(env, msg)
 	case REPMGR_RESOLVE_LIMBO:
 		ret = resolve_limbo_wrapper(env, ip);
 		break;
+	case REPMGR_RESTART_CLIENT:
+		ret = serve_restart_client_request(env, msg);
+		break;
 	case REPMGR_SHARING:
 		dbt = &msg->v.gmdb_msg.request;
-		ret = __repmgr_refresh_membership(env, dbt->data, dbt->size);
+		ret = __repmgr_refresh_membership(env, dbt->data, dbt->size,
+		    (conn == NULL ? DB_REPMGR_VERSION : conn->version));
 		break;
 	default:
 		ret = __db_unknown_path(env, "serve_repmgr_request");
 		break;
 	}
-	if ((conn = msg->v.gmdb_msg.conn) != NULL) {
+	if (conn != NULL) {
+		/*
+		 * A site that removed itself may have already closed its
+		 * connections.  Do not return an error and panic if we
+		 * can't close the one-shot GMDB connection for a remove
+		 * request here.
+		 */
 		if ((t_ret = __repmgr_close_connection(env, conn)) != 0 &&
-		    ret == 0)
+		    ret == 0 && mtype != REPMGR_REMOVE_REQUEST)
 			ret = t_ret;
 		if ((t_ret = __repmgr_decr_conn_ref(env, conn)) != 0 &&
 		    ret == 0)
 			ret = t_ret;
 	}
-	ENV_LEAVE(env, ip);
 	return (ret);
 }
 
@@ -674,28 +940,47 @@ serve_join_request(env, ip, msg)
 {
 	DB_REP *db_rep;
 	REPMGR_CONNECTION *conn;
+	REPMGR_SITE *site;
 	DBT *dbt;
 	__repmgr_site_info_args site_info;
+	__repmgr_v4site_info_args v4site_info;
 	u_int8_t *buf;
 	char *host;
 	size_t len;
-	u_int32_t status;
+	u_int32_t membership, status;
 	int eid, ret, t_ret;
 
 	db_rep = env->rep_handle;
 	COMPQUIET(status, 0);
 
 	conn = msg->v.gmdb_msg.conn;
+	DB_ASSERT(env, conn->version > 0 && conn->version <= DB_REPMGR_VERSION);
 	dbt = &msg->v.gmdb_msg.request;
-	ret = __repmgr_site_info_unmarshal(env,
-	    &site_info, dbt->data, dbt->size, NULL);
+	if (conn->version < 5) {
+		ret = __repmgr_v4site_info_unmarshal(env,
+		    &v4site_info, dbt->data, dbt->size, NULL);
+		site_info.host = v4site_info.host;
+		site_info.port = v4site_info.port;
+		site_info.status = v4site_info.flags;
+		site_info.flags = 0;
+	} else
+		ret = __repmgr_site_info_unmarshal(env,
+		    &site_info, dbt->data, dbt->size, NULL);
 
 	host = site_info.host.data;
 	host[site_info.host.size - 1] = '\0';
 	RPRINT(env, (env, DB_VERB_REPMGR_MISC,
 	    "Request to join group from %s:%u", host, (u_int)site_info.port));
 
-	if ((ret = __repmgr_hold_master_role(env, conn)) == DB_REP_UNAVAIL)
+	/*
+	 * If the requesting site is already known, get its group membership
+	 * status for the 2-site edge case check in hold_master_role().
+	 */
+	membership = 0;
+	if ((site = __repmgr_lookup_site(env, host, site_info.port)) != NULL)
+		membership = site->membership;
+	if ((ret =
+	    __repmgr_hold_master_role(env, conn, membership)) == DB_REP_UNAVAIL)
 		return (0);
 	if (ret != 0)
 		return (ret);
@@ -703,7 +988,23 @@ serve_join_request(env, ip, msg)
 	LOCK_MUTEX(db_rep->mutex);
 	if ((ret = __repmgr_find_site(env, host, site_info.port, &eid)) == 0) {
 		DB_ASSERT(env, eid != db_rep->self_eid);
-		status = SITE_FROM_EID(eid)->membership;
+		site = SITE_FROM_EID(eid);
+		status = site->membership;
+		/*
+		 * Remote site electability is usually exchanged when
+		 * a connection is established, but when a new site
+		 * joins the repgroup there is a brief gap between the
+		 * join and the connection.  Record electability for
+		 * the joining site so that we are not overly conservative
+		 * about the number of acks we require for a PERM
+		 * transaction if the joining site is unelectable.
+		 */
+		if (FLD_ISSET(site_info.flags, SITE_JOIN_ELECTABLE)) {
+			F_SET(site, SITE_ELECTABLE);
+			FLD_CLR(site_info.flags, SITE_JOIN_ELECTABLE);
+		} else
+			F_CLR(site, SITE_ELECTABLE);
+		F_SET(site, SITE_HAS_PRIO);
 	}
 	UNLOCK_MUTEX(db_rep->mutex);
 	if (ret != 0)
@@ -712,7 +1013,8 @@ serve_join_request(env, ip, msg)
 	switch (status) {
 	case 0:
 	case SITE_ADDING:
-		ret = __repmgr_update_membership(env, ip, eid, SITE_ADDING);
+		ret = __repmgr_update_membership(env, ip, eid, SITE_ADDING,
+			site_info.flags);
 		break;
 	case SITE_PRESENT:
 		/* Already in desired state. */
@@ -729,7 +1031,7 @@ serve_join_request(env, ip, msg)
 		goto err;
 
 	LOCK_MUTEX(db_rep->mutex);
-	ret = __repmgr_marshal_member_list(env, &buf, &len);
+	ret = __repmgr_marshal_member_list(env, conn->version, &buf, &len);
 	UNLOCK_MUTEX(db_rep->mutex);
 	if (ret != 0)
 		goto err;
@@ -760,6 +1062,7 @@ serve_remove_request(env, ip, msg)
 	REPMGR_SITE *site;
 	DBT *dbt;
 	__repmgr_site_info_args site_info;
+	__repmgr_v4site_info_args v4site_info;
 	char *host;
 	u_int32_t status, type;
 	int eid, ret, t_ret;
@@ -768,16 +1071,26 @@ serve_remove_request(env, ip, msg)
 	db_rep = env->rep_handle;
 
 	conn = msg->v.gmdb_msg.conn;
+	DB_ASSERT(env, conn->version > 0 && conn->version <= DB_REPMGR_VERSION);
 	dbt = &msg->v.gmdb_msg.request;
-	ret = __repmgr_site_info_unmarshal(env,
-	    &site_info, dbt->data, dbt->size, NULL);
+	if (conn->version < 5) {
+		ret = __repmgr_v4site_info_unmarshal(env,
+		    &v4site_info, dbt->data, dbt->size, NULL);
+		site_info.host = v4site_info.host;
+		site_info.port = v4site_info.port;
+		site_info.status = v4site_info.flags;
+		site_info.flags = 0;
+	} else
+		ret = __repmgr_site_info_unmarshal(env,
+		    &site_info, dbt->data, dbt->size, NULL);
 
 	host = site_info.host.data;
 	host[site_info.host.size - 1] = '\0';
 	RPRINT(env, (env, DB_VERB_REPMGR_MISC,
 	    "Request to remove %s:%u from group", host, (u_int)site_info.port));
 
-	if ((ret = __repmgr_hold_master_role(env, conn)) == DB_REP_UNAVAIL)
+	if ((ret =
+	    __repmgr_hold_master_role(env, conn, 0)) == DB_REP_UNAVAIL)
 		return (0);
 	if (ret != 0)
 		return (ret);
@@ -810,7 +1123,8 @@ serve_remove_request(env, ip, msg)
 		break;
 	case SITE_PRESENT:
 	case SITE_DELETING:
-		ret = __repmgr_update_membership(env, ip, eid, SITE_DELETING);
+		ret = __repmgr_update_membership(env, ip, eid, SITE_DELETING,
+			site_info.flags);
 		break;
 	default:
 		ret = __db_unknown_path(env, "serve_remove_request");
@@ -829,7 +1143,176 @@ err:
 	default:
 		return (ret);
 	}
-	return (__repmgr_send_sync_msg(env, conn, type, NULL, 0));
+	/*
+	 * It is possible when a site removes itself that by now it has
+	 * already acted on the first GMDB update and closed its connections.
+	 * Do not return an error and panic if we can't send the final
+	 * status of the remove operation.
+	 */
+	if ((ret = __repmgr_send_sync_msg(env, conn, type, NULL, 0)) != 0)
+		RPRINT(env, (env, DB_VERB_REPMGR_MISC,
+		    "Problem sending remove site status message %d", ret));
+	return (0);
+}
+
+/*
+ * Serve the REPMGR_RESTART_CLIENT message by restarting this site as a
+ * client if it is not already a client.  Always sends back a
+ * REPMGR_PREFMAS_SUCCESS message with an empty payload.
+ */
+static int
+serve_restart_client_request(env, msg)
+	ENV *env;
+	REPMGR_MESSAGE *msg;
+{
+	DB_REP *db_rep;
+	REP * rep;
+	REPMGR_CONNECTION *conn;
+	int ret, t_ret;
+
+	db_rep = env->rep_handle;
+	rep = db_rep->region;
+	ret = 0;
+
+	RPRINT(env, (env, DB_VERB_REPMGR_MISC,
+	    "Serving restart_client request"));
+	conn = msg->v.gmdb_msg.conn;
+	DB_ASSERT(env, conn->version > 0 && conn->version <= DB_REPMGR_VERSION);
+	/* No need to read payload - it is just a dummy byte. */
+
+	if (IS_PREFMAS_MODE(env) && !F_ISSET(rep, REP_F_CLIENT))
+		ret = __repmgr_become_client(env);
+
+	if ((t_ret = __repmgr_send_sync_msg(env, conn,
+	    REPMGR_PREFMAS_SUCCESS, NULL, 0)) != 0)
+		RPRINT(env, (env, DB_VERB_REPMGR_MISC,
+		    "Problem sending restart client success message %d", ret));
+
+	if (ret == 0 && t_ret != 0)
+		ret = t_ret;
+	RPRINT(env, (env, DB_VERB_REPMGR_MISC,
+	    "Request for restart_client returning %d", ret));
+	return (ret);
+}
+
+/*
+ * Serve the REPMGR_READONLY_MASTER message by turning this site into a
+ * readonly master.  Always sends back a REPMGR_READONLY_RESPONSE message with
+ * a payload containing this site's gen and next LSN expected.  If there are
+ * any errors, the gen is 0 and the next LSN is [0,0].
+ */
+static int
+serve_readonly_master_request(env, msg)
+	ENV *env;
+	REPMGR_MESSAGE *msg;
+{
+	REPMGR_CONNECTION *conn;
+	__repmgr_readonly_response_args response;
+	u_int8_t buf[__REPMGR_READONLY_RESPONSE_SIZE];
+	int ret, t_ret;
+
+	ret = 0;
+
+	RPRINT(env, (env, DB_VERB_REPMGR_MISC,
+	    "Serving readonly_master request"));
+	conn = msg->v.gmdb_msg.conn;
+	DB_ASSERT(env, conn->version > 0 && conn->version <= DB_REPMGR_VERSION);
+	/* No need to read payload - it is just a dummy byte. */
+
+	if (IS_PREFMAS_MODE(env))
+		ret = __rep_become_readonly_master(env,
+		    &response.generation, &response.lsn);
+
+	__repmgr_readonly_response_marshal(env, &response, buf);
+	if ((t_ret = __repmgr_send_sync_msg(env, conn,
+	    REPMGR_READONLY_RESPONSE, buf,
+	    __REPMGR_READONLY_RESPONSE_SIZE)) != 0)
+		RPRINT(env, (env, DB_VERB_REPMGR_MISC,
+		    "Problem sending readonly response message %d", ret));
+	if (ret == 0 && t_ret != 0)
+		ret = t_ret;
+	RPRINT(env, (env, DB_VERB_REPMGR_MISC,
+	    "Request for readonly_master returning %d", ret));
+	return (ret);
+}
+
+/*
+ * Serve the REPMGR_LSNHIST_REQUEST message by retrieving information from
+ * this site's LSN history database for the requested gen.  If the requested
+ * gen exists at this site, sends back a REPMGR_LSNHIST_RESPONSE message
+ * containing the LSN and timestamp at the requested gen and the LSN for the
+ * next gen if that gen exists (next gen LSN is [0,0] if next gen doesn't
+ * yet exist at this site.)  Sends back a PREFMAS_FAILURE message if the
+ * requested gen does not yet exist at this site or if there are any errors.
+ */
+static int
+serve_lsnhist_request(env, ip, msg)
+	ENV *env;
+	DB_THREAD_INFO *ip;
+	REPMGR_MESSAGE *msg;
+{
+	REPMGR_CONNECTION *conn;
+	DBT *dbt;
+	__repmgr_lsnhist_match_args lsnhist_match;
+	__rep_lsn_hist_data_args lsnhist_data, next_lsnhist_data;
+	__rep_lsn_hist_key_args key;
+	u_int8_t match_buf[__REPMGR_LSNHIST_MATCH_SIZE];
+	DB_LSN next_gen_lsn;
+	int ret, t_ret;
+
+	RPRINT(env, (env, DB_VERB_REPMGR_MISC, "Serving lsnhist request"));
+	conn = msg->v.gmdb_msg.conn;
+	DB_ASSERT(env, conn->version > 0 && conn->version <= DB_REPMGR_VERSION);
+	/* Read lsn_hist_key incoming payload to get gen being requested. */
+	dbt = &msg->v.gmdb_msg.request;
+	if ((ret = __rep_lsn_hist_key_unmarshal(env,
+	    &key, dbt->data, dbt->size, NULL)) != 0)
+		return (ret);
+	if (key.version != REP_LSN_HISTORY_FMT_VERSION) {
+		RPRINT(env, (env, DB_VERB_REPMGR_MISC,
+		    "serve_lsnhist_request version mismatch"));
+		return (0);
+	}
+
+	/*
+	 * There's no need to retry if we don't find an lsnhist record for
+	 * requested gen.  This site is either a temporary master or a client,
+	 * which means that if it doesn't already have an lsnhist record at
+	 * this gen, it is highly unlikely to get one in the near future.
+	 */
+	if ((ret = __rep_get_lsnhist_data(env,
+	    ip, key.gen, &lsnhist_data)) == 0) {
+
+		if ((t_ret = __rep_get_lsnhist_data(env,
+		    ip, key.gen + 1, &next_lsnhist_data)) == 0)
+			next_gen_lsn = next_lsnhist_data.lsn;
+		else
+			ZERO_LSN(next_gen_lsn);
+
+		lsnhist_match.lsn = lsnhist_data.lsn;
+		lsnhist_match.hist_sec = lsnhist_data.hist_sec;
+		lsnhist_match.hist_nsec = lsnhist_data.hist_nsec;
+		lsnhist_match.next_gen_lsn = next_gen_lsn;
+		__repmgr_lsnhist_match_marshal(env, &lsnhist_match, match_buf);
+		if ((t_ret = __repmgr_send_sync_msg(env, conn,
+		    REPMGR_LSNHIST_RESPONSE, match_buf,
+		    __REPMGR_LSNHIST_MATCH_SIZE)) != 0)
+			RPRINT(env, (env, DB_VERB_REPMGR_MISC,
+			    "Problem sending lsnhist response message %d",
+			    ret));
+	} else if ((t_ret = __repmgr_send_sync_msg(env, conn,
+	    REPMGR_PREFMAS_FAILURE, NULL, 0)) != 0)
+		RPRINT(env, (env, DB_VERB_REPMGR_MISC,
+		    "Problem sending prefmas failure message %d", ret));
+
+	/* Do not return an error if LSN history record not found. */
+	if (ret == DB_NOTFOUND)
+		ret = 0;
+	if (ret == 0 && t_ret != 0)
+		ret = t_ret;
+	RPRINT(env, (env, DB_VERB_REPMGR_MISC,
+	    "Request for lsnhist returning %d", ret));
+	return (ret);
 }
 
 /*
@@ -844,7 +1327,8 @@ resolve_limbo_wrapper(env, ip)
 {
 	int do_close, ret, t_ret;
 
-	if ((ret = __repmgr_hold_master_role(env, NULL)) == DB_REP_UNAVAIL)
+	if ((ret =
+	    __repmgr_hold_master_role(env, NULL, 0)) == DB_REP_UNAVAIL)
 		return (0);
 	if (ret != 0)
 		return (ret);
@@ -917,7 +1401,13 @@ resolve_limbo_int(env, ip)
 	if (orig_status == SITE_PRESENT || orig_status == 0)
 		goto out;
 
-	if (IS_ZERO_LSN(db_rep->limbo_failure))
+	/*
+	 * It is possible after an autotakeover on a master to have no
+	 * limbo_failure LSN but to have a limbo_victim that was found
+	 * in the gmdb that still needs to be resolved.
+	 */
+	if (IS_ZERO_LSN(db_rep->limbo_failure) &&
+	    !db_rep->limbo_resolution_needed)
 		goto out;
 
 	/*
@@ -947,7 +1437,8 @@ resolve_limbo_int(env, ip)
 		    ip, NULL, &txn, DB_IGNORE_LEASE)) != 0)
 			goto out;
 
-		marshal_site_data(env, orig_status, data_buf, &data_dbt);
+		marshal_site_data(env,
+		    orig_status, site->gmdb_flags, data_buf, &data_dbt);
 
 		ret = __db_put(db_rep->gmdb, ip, txn, &key_dbt, &data_dbt, 0);
 		if ((t_ret = __db_txn_auto_resolve(env, txn, 0, ret)) != 0 &&
@@ -980,15 +1471,15 @@ resolve_limbo_int(env, ip)
 	UNLOCK_MUTEX(db_rep->mutex);
 	locked = FALSE;
 	status = NEXT_STATUS(orig_status);
-	if ((ret = finish_gmdb_update(env,
-	    ip, &key_dbt, orig_status, status, &logrec)) != 0)
+	if ((ret = finish_gmdb_update(env, ip,
+	    &key_dbt, orig_status, status, site->gmdb_flags, &logrec)) != 0)
 		goto out;
 
 	/* Track modified membership status in our in-memory sites array. */
 	LOCK_MUTEX(db_rep->mutex);
 	locked = TRUE;
 	if ((ret = __repmgr_set_membership(env,
-	    addr.host, addr.port, status)) != 0)
+	    addr.host, addr.port, status, site->gmdb_flags)) != 0)
 		goto out;
 	__repmgr_set_sites(env);
 
@@ -1005,14 +1496,15 @@ out:
  * status is inferred (ADDING -> PRESENT, or DELETING -> 0).
  *
  * PUBLIC: int __repmgr_update_membership __P((ENV *,
- * PUBLIC:     DB_THREAD_INFO *, int, u_int32_t));
+ * PUBLIC:     DB_THREAD_INFO *, int, u_int32_t, u_int32_t));
  */
 int
-__repmgr_update_membership(env, ip, eid, pstatus)
+__repmgr_update_membership(env, ip, eid, pstatus, site_flags)
 	ENV *env;
 	DB_THREAD_INFO *ip;
 	int eid;
 	u_int32_t pstatus;	/* Provisional status. */
+	u_int32_t site_flags;
 {
 	DB_REP *db_rep;
 	REPMGR_SITE *site;
@@ -1092,7 +1584,7 @@ retry:
 	 * those seem even more confusing.
 	 */
 	if ((ret = __repmgr_set_membership(env,
-	    addr.host, addr.port, pstatus)) != 0)
+	    addr.host, addr.port, pstatus, site_flags)) != 0)
 		goto err;
 	__repmgr_set_sites(env);
 
@@ -1108,7 +1600,7 @@ retry:
 	if ((ret = __txn_begin(env, ip, NULL, &txn, DB_IGNORE_LEASE)) != 0)
 		goto err;
 	marshal_site_key(env, &addr, key_buf, &key_dbt, &logrec);
-	marshal_site_data(env, pstatus, status_buf, &data_dbt);
+	marshal_site_data(env, pstatus, site_flags, status_buf, &data_dbt);
 	if ((ret = __db_put(db_rep->gmdb,
 	    ip, txn, &key_dbt, &data_dbt, 0)) != 0)
 		goto err;
@@ -1152,13 +1644,14 @@ retry:
 	locked = FALSE;
 
 	if ((ret = finish_gmdb_update(env, ip,
-	    &key_dbt, pstatus, ult_status, &logrec)) != 0)
+	    &key_dbt, pstatus, ult_status, site_flags, &logrec)) != 0)
 		goto err;
 
 	/* Track modified membership status in our in-memory sites array. */
 	LOCK_MUTEX(db_rep->mutex);
 	locked = TRUE;
-	ret = __repmgr_set_membership(env, addr.host, addr.port, ult_status);
+	ret = __repmgr_set_membership(env, addr.host, addr.port,
+	    ult_status, site_flags);
 	__repmgr_set_sites(env);
 
 err:
@@ -1173,7 +1666,7 @@ err:
 		 * that we keep in sync.
 		 */
 		(void)__repmgr_set_membership(env,
-		    addr.host, addr.port, orig_status);
+		    addr.host, addr.port, orig_status, site_flags);
 	}
 	if ((t_ret = __repmgr_cleanup_gmdb_op(env, do_close)) != 0 &&
 	    ret == 0)
@@ -1215,13 +1708,14 @@ retry:
 	UNLOCK_MUTEX(db_rep->mutex);
 
 	marshal_site_key(env, &addr, key_buf, &key_dbt, &logrec);
-	if ((ret = finish_gmdb_update(env,
-	    ip, &key_dbt, cur_status, new_status, &logrec)) != 0)
+	if ((ret = finish_gmdb_update(env, ip,
+	    &key_dbt, cur_status, new_status, site->gmdb_flags, &logrec)) != 0)
 		goto err;
 
 	/* Track modified membership status in our in-memory sites array. */
 	LOCK_MUTEX(db_rep->mutex);
-	ret = __repmgr_set_membership(env, addr.host, addr.port, new_status);
+	ret = __repmgr_set_membership(env, addr.host, addr.port,
+	    new_status, site->gmdb_flags);
 	__repmgr_set_sites(env);
 	UNLOCK_MUTEX(db_rep->mutex);
 
@@ -1301,11 +1795,11 @@ __repmgr_set_gm_version(env, ip, txn, version)
  * really deleted.
  */
 static int
-finish_gmdb_update(env, ip, key_dbt, prev_status, status, logrec)
+finish_gmdb_update(env, ip, key_dbt, prev_status, status, flags, logrec)
 	ENV *env;
 	DB_THREAD_INFO *ip;
 	DBT *key_dbt;
-	u_int32_t prev_status, status;
+	u_int32_t prev_status, status, flags;
 	__repmgr_member_args *logrec;
 {
 	DB_REP *db_rep;
@@ -1324,7 +1818,7 @@ finish_gmdb_update(env, ip, key_dbt, prev_status, status, logrec)
 	if (status == 0)
 		ret = __db_del(db_rep->gmdb, ip, txn, key_dbt, 0);
 	else {
-		marshal_site_data(env, status, data_buf, &data_dbt);
+		marshal_site_data(env, status, flags, data_buf, &data_dbt);
 		ret = __db_put(db_rep->gmdb, ip, txn, key_dbt, &data_dbt, 0);
 	}
 	if (ret != 0)
@@ -1486,12 +1980,14 @@ __repmgr_cleanup_gmdb_op(env, do_close)
  * the mutex needs to be available in order to send out the log
  * records.
  *
- * PUBLIC: int __repmgr_hold_master_role __P((ENV *, REPMGR_CONNECTION *));
+ * PUBLIC: int __repmgr_hold_master_role __P((ENV *,
+ * PUBLIC:     REPMGR_CONNECTION *, u_int32_t));
  */
 int
-__repmgr_hold_master_role(env, conn)
+__repmgr_hold_master_role(env, conn, membership)
 	ENV *env;
 	REPMGR_CONNECTION *conn;
+	u_int32_t membership;
 {
 	DB_REP *db_rep;
 	REP *rep;
@@ -1515,6 +2011,23 @@ __repmgr_hold_master_role(env, conn)
 			db_rep->gmdb_busy = TRUE;
 	}
 	UNLOCK_MUTEX(db_rep->mutex);
+
+	/*
+	 * Check for an edge case that is possible with a newly-joining site
+	 * in a 2SITE_STRICT group.  If both sites crash before the joining
+	 * site receives this site's gmdb contents with the GM_SUCCESS message,
+	 * the group is left is a state where this site can't elect itself
+	 * master and the joining site has no master to retry joining the
+	 * group.  Be a little extra lenient if the joining site retries its
+	 * join when there is no master: enable caller to return GM_SUCCESS
+	 * and this site's gmdb contents again if the joining site is already
+	 * in the ADDING or PRESENT state in this site's gmdb.
+	 */
+	if (conn != NULL && ret == DB_REP_UNAVAIL && rep->config_nsites == 2 &&
+	    FLD_ISSET(rep->config, REP_C_2SITE_STRICT) &&
+	    (membership == SITE_ADDING || membership == SITE_PRESENT))
+		ret = 0;
+
 	if (conn != NULL && ret == DB_REP_UNAVAIL &&
 	    (t_ret = reject_fwd(env, conn)) != 0)
 		ret = t_ret;
@@ -1617,16 +2130,18 @@ marshal_site_key(env, addr, buf, dbt, logrec)
 }
 
 static void
-marshal_site_data(env, status, buf, dbt)
+marshal_site_data(env, status, flags, buf, dbt)
 	ENV *env;
 	u_int32_t status;
+	u_int32_t flags;
 	u_int8_t *buf;
 	DBT *dbt;
 {
-	__repmgr_membership_data_args member_status;
+	__repmgr_membership_data_args member_data;
 
-	member_status.flags = status;
-	__repmgr_membership_data_marshal(env, &member_status, buf);
+	member_data.status = status;
+	member_data.flags = flags;
+	__repmgr_membership_data_marshal(env, &member_data, buf);
 	DB_INIT_DBT(*dbt, buf, __REPMGR_MEMBERSHIP_DATA_SIZE);
 }
 
@@ -1640,16 +2155,107 @@ __repmgr_set_sites(env)
 	ENV *env;
 {
 	DB_REP *db_rep;
+	REP *rep;
 	int ret;
 	u_int32_t n;
 	u_int i;
 
 	db_rep = env->rep_handle;
+	rep = db_rep->region;
 
 	for (i = 0, n = 0; i < db_rep->site_cnt; i++) {
-		if (db_rep->sites[i].membership > 0)
+		/*
+		 * Views do not count towards nsites because they cannot
+		 * vote in elections, become master or contribute to
+		 * durability.
+		 */
+		if (db_rep->sites[i].membership > 0 &&
+		    !FLD_ISSET(db_rep->sites[i].gmdb_flags, SITE_VIEW))
 			n++;
 	}
 	ret = __rep_set_nsites_int(env, n);
 	DB_ASSERT(env, ret == 0);
+	if (FLD_ISSET(rep->config,
+	    REP_C_PREFMAS_MASTER | REP_C_PREFMAS_CLIENT) &&
+	    rep->config_nsites > 2)
+		__db_errx(env, DB_STR("3701",
+	    "More than two sites in preferred master replication group"));
+}
+
+/*
+ * If a site is rejoining a 2-site repgroup with 2SITE_STRICT off
+ * and has a rejection because it needs to catch up with the latest
+ * group membership database, it cannot call an election right away
+ * because it would win with only its own vote and ignore an existing
+ * master in the repgroup.  Instead, this routine is used to call the
+ * deferred election after the site has rejoined the repgroup successfully.
+ */
+static int
+rejoin_deferred_election(env)
+	ENV *env;
+{
+	DB_REP *db_rep;
+	u_int32_t flags;
+	int eid, ret;
+
+	db_rep = env->rep_handle;
+	LOCK_MUTEX(db_rep->mutex);
+
+	/*
+	 * First, retry all connections so that the election can communicate
+	 * with the other sites.  Normally there should only be one other
+	 * site in the repgroup, but it is safest to retry all remote sites
+	 * found in case the group membership changed while we were gone.
+	 */
+	FOR_EACH_REMOTE_SITE_INDEX(eid) {
+		if ((ret =
+		    __repmgr_schedule_connection_attempt(env, eid, TRUE)) != 0)
+			break;
+	}
+
+	/*
+	 * Call an immediate, but not a fast, election because a fast
+	 * election reduces the number of votes needed by 1.
+	 */
+	flags = ELECT_F_EVENT_NOTIFY;
+	if (FLD_ISSET(db_rep->region->config, REP_C_ELECTIONS))
+		LF_SET(ELECT_F_IMMED);
+	else
+		RPRINT(env, (env, DB_VERB_REPMGR_MISC,
+		    "Deferred rejoin election, but no elections"));
+	ret = __repmgr_init_election(env, flags);
+
+	UNLOCK_MUTEX(db_rep->mutex);
+	return (ret);
+}
+/*
+ * If a site is rejoining a preferred master replication group and has a
+ * rejection because it needs to catch up with the latest group membership
+ * database, it needs to establish its "regular" connection to the other site
+ * so that it can proceed through the preferred master startup sequence.
+ */
+static int
+rejoin_connections(env)
+	ENV *env;
+{
+	DB_REP *db_rep;
+	int eid, ret;
+
+	db_rep = env->rep_handle;
+	ret = 0;
+	LOCK_MUTEX(db_rep->mutex);
+
+	/*
+	 * Retry all connections.   Normally there should only be one other
+	 * site in the repgroup, but it is safest to retry all remote sites
+	 * found in case the group membership changed while we were gone.
+	 */
+	FOR_EACH_REMOTE_SITE_INDEX(eid) {
+		if ((ret =
+		    __repmgr_schedule_connection_attempt(env, eid, TRUE)) != 0)
+			break;
+	}
+
+	UNLOCK_MUTEX(db_rep->mutex);
+	return (ret);
 }

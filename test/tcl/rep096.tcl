@@ -1,6 +1,6 @@
-# See the file LICENSE for redistribution information.
+# Copyright (c) 2010, 2020 Oracle and/or its affiliates.  All rights reserved.
 #
-# Copyright (c) 2010, 2012 Oracle and/or its affiliates.  All rights reserved.
+# See the file LICENSE for license information.
 #
 # $Id$
 #
@@ -81,14 +81,18 @@ proc rep096_sub { method niter tnum logset recargs largs } {
 	global verbose_type
 
 	set verbargs ""
+	set varg ""
 	if { $rep_verbose == 1 } {
 		set verbargs " -verbose {$verbose_type on} "
+		set varg " -v "
 	}
 
 	set repmemargs ""
 	if { $repfiles_in_memory } {
 		set repmemargs "-rep_inmem_files "
 	}
+
+	set sslargs [setup_repmgr_sslargs]
 
 	env_cleanup $testdir
 
@@ -122,6 +126,8 @@ proc rep096_sub { method niter tnum logset recargs largs } {
 	set nsites 2
 	replicate_make_config $masterdir 0 100
 	replicate_make_config $clientdir 1 1
+	setup_repmgr_ssl $masterdir
+	setup_repmgr_ssl $clientdir
 
 	#
 	# Open a master and a client, but only with -rep.  Note that we need
@@ -131,12 +137,13 @@ proc rep096_sub { method niter tnum logset recargs largs } {
 	set env_cmd(M) "berkdb_env_noerr -create -log_max 1000000 \
 	    -lock_max_objects $max_locks -lock_max_locks $max_locks \
 	    -home $masterdir -errpfx MASTER $verbargs $repmemargs \
-	    $m_txnargs $m_logargs -rep -thread"
+	    $sslargs $m_txnargs $m_logargs -rep -thread"
 	set masterenv [eval $env_cmd(M) $recargs]
 
 	set env_cmd(C) "berkdb_env_noerr -create $c_txnargs $c_logargs \
 	    -lock_max_objects $max_locks -lock_max_locks $max_locks \
-	    -home $clientdir -errpfx CLIENT $verbargs $repmemargs -rep -thread"
+	    -home $clientdir -errpfx CLIENT $verbargs $repmemargs \
+	    $sslargs -rep -thread"
 	set clientenv [eval $env_cmd(C) $recargs]
 
 	#
@@ -144,65 +151,73 @@ proc rep096_sub { method niter tnum logset recargs largs } {
 	#
 	puts "\tRep$tnum.b: Start db_replicate on each env."
 	set dpid(M) [eval {exec $util_path/db_replicate -h $masterdir} \
-	    -M -t 5 &]
-	set dpid(C) [eval {exec $util_path/db_replicate -h $clientdir} &]
+	    -M -t 5 $varg &]
+	set dpid(C) [eval {exec $util_path/db_replicate -h $clientdir} $varg &]
 
 	await_startup_done $clientenv
 
 	#
-	# Force a checkpoint to cause the subordinate connection 
-	# for this Tcl process to get established.  However, the
-	# checkpoint log records will get lost prior to the
+	# Force a checkpoint from a subordinate connection.  However,
+	# the checkpoint log records will likely get lost prior to the
 	# connection getting established.
 	#
-	$masterenv txn_checkpoint -force
+	puts "\tRep$tnum.c: Force checkpoint from non-rep process."
+	set cid [exec $util_path/db_checkpoint -h $masterdir -1]
 
 	#
 	# Wait for the master and client LSNs to match after this
-	# checkpoint.  That might mean waiting for the rerequest thread
+	# checkpoint.  That might mean waiting for a rerequest
 	# to run or db_replicate to call rep_flush.
 	#
 	await_condition \
 	    {[stat_field $masterenv rep_stat "Next LSN expected"] == \
 	    [stat_field $clientenv rep_stat "Next LSN expected"]}
 
-	puts "\tRep$tnum.c: Create database on master."
-	set omethod [convert_method $method]
-	set db [eval berkdb_open_noerr -create -env $masterenv -auto_commit \
-	    -mode 0644 $largs $omethod $dbname]
-	error_check_good db_open [is_valid_db $db] TRUE
+	if { $is_freebsd_test == 0 } {
+		#
+		# Now perform operations using this Tcl process with
+		# subordinate connections.  This does not work with FreeBSD.
+		#
+		set omethod [convert_method $method]
+		set db [eval berkdb_open_noerr -create -env $masterenv \
+		    -auto_commit -mode 0644 $largs $omethod $dbname]
+		error_check_good db_open [is_valid_db $db] TRUE
 
-	await_condition \
-	    {[stat_field $masterenv rep_stat "Next LSN expected"] == \
-	    [stat_field $clientenv rep_stat "Next LSN expected"]}
+		await_condition \
+		    {[stat_field $masterenv rep_stat "Next LSN expected"] == \
+		    [stat_field $clientenv rep_stat "Next LSN expected"]}
 
-	if { !$databases_in_memory } {
-		puts "\tRep$tnum.d: Verify database exists on client."
-		error_check_good client_db [file exists $clientdir/$dbname] 1
-	} 
+		if { !$databases_in_memory } {
+			error_check_good client_db \
+			    [file exists $clientdir/$dbname] 1
+		} 
 
-	# Run a modified test001 in the master (and update client).
-	puts "\tRep$tnum.e: Running rep_test in replicated env."
-	eval rep_test $method $masterenv $db $niter 0 0 0 $largs
-
-	await_condition \
-	    {[stat_field $masterenv rep_stat "Next LSN expected"] == \
-	    [stat_field $clientenv rep_stat "Next LSN expected"]}
-
-	# Check that databases are in-memory or on-disk as expected.
-	check_db_location $masterenv
-	check_db_location $clientenv
+		# Run a modified test001 in the master (and update client).
+		puts "\tRep$tnum.d: Running rep_test in replicated env."
+		eval rep_test $method $masterenv $db $niter 0 0 0 $largs
 	
-	$db close
+		await_condition \
+		    {[stat_field $masterenv rep_stat "Next LSN expected"] == \
+		    [stat_field $clientenv rep_stat "Next LSN expected"]}
 
+		# Check that databases are in-memory or on-disk as expected.
+		check_db_location $masterenv
+		check_db_location $clientenv
+	
+		$db close
+		rep_verify $masterdir $masterenv $clientdir $clientenv 1 1 1
+	} else {
+		puts "\tRep$tnum.d: Force 2nd checkpoint from non-rep process."
+		set cid [exec $util_path/db_checkpoint -h $masterdir -1]
+	}
+
+	puts "\tRep$tnum.e: Await final processing."
 	await_condition \
 	    {[stat_field $masterenv rep_stat "Next LSN expected"] == \
 	    [stat_field $clientenv rep_stat "Next LSN expected"]}
 
 	tclkill $dpid(C)
 	tclkill $dpid(M)
-
-	rep_verify $masterdir $masterenv $clientdir $clientenv 1 1 1
 
 	error_check_good masterenv_close [$masterenv close] 0
 	error_check_good clientenv_close [$clientenv close] 0

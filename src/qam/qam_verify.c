@@ -1,7 +1,7 @@
 /*-
- * See the file LICENSE for redistribution information.
+ * Copyright (c) 1999, 2020 Oracle and/or its affiliates.  All rights reserved.
  *
- * Copyright (c) 1999, 2012 Oracle and/or its affiliates.  All rights reserved.
+ * See the file LICENSE for license information.
  *
  * $Id$
  */
@@ -47,6 +47,14 @@ __qam_vrfy_meta(dbp, vdp, meta, pgno, flags)
 	buf = NULL;
 	names = NULL;
 
+	if (dbp->type != DB_QUEUE) {
+		EPRINT((env, DB_STR_A("1215",
+		    "Page %lu: invalid page type %u for %s database",
+		    "%lu %u %s"), (u_long)pgno, TYPE(meta),
+		    __db_dbtype_to_string(dbp->type)));
+		return DB_VERIFY_FATAL;
+	}
+
 	if ((ret = __db_vrfy_getpageinfo(vdp, pgno, &pip)) != 0)
 		return (ret);
 
@@ -83,7 +91,14 @@ __qam_vrfy_meta(dbp, vdp, meta, pgno, flags)
 	 * re_len:  If this is bad, we can't safely verify queue data pages, so
 	 * return DB_VERIFY_FATAL
 	 */
-	if (DB_ALIGN(meta->re_len + sizeof(QAMDATA) - 1, sizeof(u_int32_t)) *
+	if (meta->rec_page == 0) {
+		EPRINT((env, DB_STR_A("1214",
+		    "Page %lu: the number of records per page %lu is bad",
+		    "%lu %lu"), (u_long)pgno, (u_long)meta->rec_page));
+		ret = DB_VERIFY_FATAL;
+		goto err;
+	} else if (DB_ALIGN(meta->re_len +
+	    sizeof(QAMDATA) - 1, sizeof(u_int32_t)) *
 	    meta->rec_page + QPAGE_SZ(dbp) > dbp->pgsize) {
 		EPRINT((env, DB_STR_A("1147",
     "Page %lu: queue record length %lu too high for page size and recs/page",
@@ -104,6 +119,25 @@ __qam_vrfy_meta(dbp, vdp, meta, pgno, flags)
 	}
 
 	/*
+	 * Check for invalid meta data values.
+	 */
+	if (meta->re_len == 0) {
+		EPRINT((env, DB_STR("5537", "Invalid record length of 0.")));
+		ret = DB_VERIFY_FATAL;
+		goto err;
+	}
+	if (meta->first_recno == 0) {
+		EPRINT((env, DB_STR("5538", "Invalid first_recno value of 0.")));
+		ret = DB_VERIFY_FATAL;
+		goto err;
+	}
+	if (meta->cur_recno == 0) {
+		EPRINT((env, DB_STR("5539", "Invalid cur_recno value of 0.")));
+		ret = DB_VERIFY_FATAL;
+		goto err;
+	}
+
+	/*
 	 * There's no formal maximum extentsize, and a 0 value represents
 	 * no extents, so there's nothing to verify.
 	 *
@@ -115,14 +149,14 @@ __qam_vrfy_meta(dbp, vdp, meta, pgno, flags)
 	 * this assumption fails.  (We need the qp info to be reasonable
 	 * before we do per-page verification of queue extents.)
 	 */
-	if (F_ISSET(vdp, VRFY_QMETA_SET)) {
+	if (F_ISSET(vdp, SALVAGE_QMETA_SET)) {
 		isbad = 1;
 		EPRINT((env, DB_STR_A("1148",
 		    "Page %lu: database contains multiple Queue metadata pages",
 		    "%lu"), (u_long)pgno));
 		goto err;
 	}
-	F_SET(vdp, VRFY_QMETA_SET);
+	F_SET(vdp, SALVAGE_QMETA_SET);
 	qp->page_ext = meta->page_ext;
 	dbp->pgsize = meta->dbmeta.pagesize;
 	qp->q_meta = pgno;
@@ -325,6 +359,14 @@ __qam_vrfy_data(dbp, vdp, h, pgno, flags)
 	QAMDATA *qp;
 	db_recno_t i;
 
+	if (dbp->type != DB_QUEUE) {
+		EPRINT((dbp->env, DB_STR_A("1215",
+		    "Page %lu: invalid page type %u for %s database",
+		    "%lu %u %s"), (u_long)pgno, TYPE(h),
+		    __db_dbtype_to_string(dbp->type)));
+		return DB_VERIFY_FATAL;
+	}
+
 	/*
 	 * Not much to do here, except make sure that flags are reasonable.
 	 *
@@ -465,7 +507,14 @@ __qam_vrfy_walkqueue(dbp, vdp, handle, callback, flags)
 	/* Verify/salvage each page. */
 	if ((ret = __db_cursor(dbp, vdp->thread_info, NULL, &dbc, 0)) != 0)
 		return (ret);
-begin:	for (; i <= stop; i++) {
+begin:	if ((stop - i) > 100000) {
+		EPRINT((env, DB_STR_A("5551",
+"Warning, many possible extends files (%lu), will take a long time to verify",
+          "%lu"), (u_long)(stop - i)));
+	}
+	for (; i <= stop; i++) {
+		if (i == UINT32_MAX)
+			break;
 		/*
 		 * If DB_SALVAGE is set, we inspect our database of completed
 		 * pages, and skip any we've already printed in the subdb pass.
@@ -526,7 +575,7 @@ begin:	for (; i <= stop; i++) {
 			if (F_ISSET(pip, VRFY_IS_ALLZEROES))
 				goto put;
 			if (pip->type != P_QAMDATA) {
-				EPRINT((env, DB_STR_A("1154",
+				EPRINT((env, DB_STR_A("1153",
 		    "Page %lu: queue database page of incorrect type %lu",
 				    "%lu %lu"), (u_long)i, (u_long)pip->type));
 				isbad = 1;

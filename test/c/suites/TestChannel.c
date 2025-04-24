@@ -1,7 +1,7 @@
 /*-
- * See the file LICENSE for redistribution information.
+ * Copyright (c) 2011, 2020 Oracle and/or its affiliates. All rights reserved.
  *
- * Copyright (c) 2011, 2012 Oracle and/or its affiliates. All rights reserved.
+ * See the file LICENSE for license information.
  */
 
 #include <ctype.h>
@@ -107,7 +107,6 @@ static void msg_disp2 __P((DB_ENV *, DB_CHANNEL *, DBT *, u_int32_t, u_int32_t))
 static void msg_disp3 __P((DB_ENV *, DB_CHANNEL *, DBT *, u_int32_t, u_int32_t));
 static void msg_disp4 __P((DB_ENV *, DB_CHANNEL *, DBT *, u_int32_t, u_int32_t));
 static void msg_disp5 __P((DB_ENV *, DB_CHANNEL *, DBT *, u_int32_t, u_int32_t));
-static int mystrcmp __P((char *, const char *));
 static void notify __P((DB_ENV *, u_int32_t, void *));
 static int is_started __P((void *));
 static void td __P((DB_ENV *));
@@ -170,9 +169,12 @@ int TestChannelTestTeardown(CuTest *test) {
 static void
 myerrcall(const DB_ENV *dbenv, const char *errpfx, const char *msg) {
 	struct report *rpt = get_rpt(dbenv);
+	char *msgp;
 
 	assert(rpt->msg_count < MAX_MSGS);
-	assert((rpt->msg[rpt->msg_count++] = strdup(msg)) != NULL);
+	msgp = strdup(msg);
+	assert(msgp != NULL);
+	rpt->msg[rpt->msg_count++] = msgp;
 }
 
 static int
@@ -207,6 +209,7 @@ setup(envp1, envp2, envp3, g)
 	u_int32_t flags;
 	int ret;
 	u_int *ports;
+	int ssl_cert_gen_success;
 
 #define CHECK(call) \
 	do {	    \
@@ -217,6 +220,24 @@ setup(envp1, envp2, envp3, g)
 	} while (0);
 
 	ports = g->ports;
+	ssl_cert_gen_success = -1;
+
+	/* 
+	 * For these test to run with ssl_support for repmgr on windows
+	 * or unix, the location of respective scripts must be in PATH.
+	 * These scripts would generate the ssl certificates necessary
+	 * for testing. If these scripts are not found then ssl will be
+	 * disabled.
+	 */
+#if defined(HAVE_REPMGR_SSL)
+#if defined(DB_WIN32)
+	ssl_cert_gen_success = system("ssl_cert_gen_script.bat > nul 2>&1");
+#else
+	ssl_cert_gen_success = system("ssl_cert_gen_script.sh > /dev/null 2>&1");
+#endif
+#endif
+	if (ssl_cert_gen_success == 0)
+		fprintf(stderr, "DEBUG : SSL enabled for Replication Manager Tests.\n");
 
 	dbenv1 = dbenv2 = dbenv3 = NULL;
 	CHECK(db_env_create(&dbenv1, 0));
@@ -229,7 +250,24 @@ setup(envp1, envp2, envp3, g)
 	CHECK(dbenv1->open(dbenv1, "DIR1", flags, 0));
 	
 	CHECK(dbenv1->rep_set_config(dbenv1, DB_REPMGR_CONF_ELECTIONS, 0));
-	CHECK(dbenv1->repmgr_site(dbenv1, "localhost", ports[0], &dbsite, 0));
+#if defined(HAVE_REPMGR_SSL)
+	if (ssl_cert_gen_success == 0) {
+		CHECK(dbenv1->repmgr_set_ssl_config(dbenv1,
+		    DB_REPMGR_SSL_CA_CERT, "certs/rootCA.crt"));
+		CHECK(dbenv1->repmgr_set_ssl_config(dbenv1,
+		    DB_REPMGR_SSL_REPNODE_CERT, "certs/repNode.crt"));
+		CHECK(dbenv1->repmgr_set_ssl_config(dbenv1,
+		    DB_REPMGR_SSL_REPNODE_PRIVATE_KEY, "certs/repNode.key"));
+		CHECK(dbenv1->repmgr_set_ssl_config(dbenv1, 
+		    DB_REPMGR_SSL_REPNODE_KEY_PASSWD, "someRandomPass"));
+		CHECK(dbenv1->repmgr_set_ssl_config(dbenv1,
+		    DB_REPMGR_SSL_VERIFY_DEPTH, "9"));
+	}
+	else
+		CHECK(dbenv1->rep_set_config(dbenv1,
+		    DB_REPMGR_CONF_DISABLE_SSL, 1));
+#endif
+	CHECK(dbenv1->repmgr_site(dbenv1, "::1", ports[0], &dbsite, 0));
 	CHECK(dbsite->set_config(dbsite, DB_LOCAL_SITE, 1));
 	CHECK(dbsite->close(dbsite));
 	CHECK(dbenv1->set_event_notify(dbenv1, notify));
@@ -243,11 +281,28 @@ setup(envp1, envp2, envp3, g)
 	setup_envdir("DIR2", 1);
 	CHECK(dbenv2->open(dbenv2, "DIR2", flags, 0));
 	CHECK(dbenv2->rep_set_config(dbenv2, DB_REPMGR_CONF_ELECTIONS, 0));
+#if defined(HAVE_REPMGR_SSL)
+	if (ssl_cert_gen_success == 0) {
+		CHECK(dbenv2->repmgr_set_ssl_config(dbenv2,
+		    DB_REPMGR_SSL_CA_CERT, "certs/rootCA.crt"));
+		CHECK(dbenv2->repmgr_set_ssl_config(dbenv2,
+		    DB_REPMGR_SSL_REPNODE_CERT, "certs/repNode.crt"));
+		CHECK(dbenv2->repmgr_set_ssl_config(dbenv2,
+		    DB_REPMGR_SSL_REPNODE_PRIVATE_KEY, "certs/repNode.key"));
+		CHECK(dbenv2->repmgr_set_ssl_config(dbenv2, 
+		    DB_REPMGR_SSL_REPNODE_KEY_PASSWD, "someRandomPass"));
+		CHECK(dbenv2->repmgr_set_ssl_config(dbenv2,
+		    DB_REPMGR_SSL_VERIFY_DEPTH, "9"));
+	}
+	else
+		CHECK(dbenv2->rep_set_config(dbenv2,
+		    DB_REPMGR_CONF_DISABLE_SSL, 1));
+#endif
 
-	CHECK(dbenv2->repmgr_site(dbenv2, "localhost", ports[1], &dbsite, 0));
+	CHECK(dbenv2->repmgr_site(dbenv2, "::1", ports[1], &dbsite, 0));
 	CHECK(dbsite->set_config(dbsite, DB_LOCAL_SITE, 1));
 	CHECK(dbsite->close(dbsite));
-	CHECK(dbenv2->repmgr_site(dbenv2, "localhost", ports[0], &dbsite, 0));
+	CHECK(dbenv2->repmgr_site(dbenv2, "::1", ports[0], &dbsite, 0));
 	CHECK(dbsite->set_config(dbsite, DB_BOOTSTRAP_HELPER, 1));
 	CHECK(dbsite->close(dbsite));
 	CHECK(dbenv2->set_event_notify(dbenv2, notify));
@@ -268,11 +323,28 @@ setup(envp1, envp2, envp3, g)
 	setup_envdir("DIR3", 1);
 	CHECK(dbenv3->open(dbenv3, "DIR3", flags, 0));
 	CHECK(dbenv3->rep_set_config(dbenv3, DB_REPMGR_CONF_ELECTIONS, 0));
+#if defined(HAVE_REPMGR_SSL)
+	if (ssl_cert_gen_success == 0) {
+		CHECK(dbenv3->repmgr_set_ssl_config(dbenv3,
+		    DB_REPMGR_SSL_CA_CERT, "certs/rootCA.crt"));
+		CHECK(dbenv3->repmgr_set_ssl_config(dbenv3,
+		    DB_REPMGR_SSL_REPNODE_CERT, "certs/repNode.crt"));
+		CHECK(dbenv3->repmgr_set_ssl_config(dbenv3,
+		    DB_REPMGR_SSL_REPNODE_PRIVATE_KEY, "certs/repNode.key"));
+		CHECK(dbenv3->repmgr_set_ssl_config(dbenv3, 
+		    DB_REPMGR_SSL_REPNODE_KEY_PASSWD, "someRandomPass"));
+		CHECK(dbenv3->repmgr_set_ssl_config(dbenv3,
+		    DB_REPMGR_SSL_VERIFY_DEPTH, "9"));
+	}
+	else
+		CHECK(dbenv3->rep_set_config(dbenv3,
+		    DB_REPMGR_CONF_DISABLE_SSL, 1));
+#endif
 
-	CHECK(dbenv3->repmgr_site(dbenv3, "localhost", ports[2], &dbsite, 0));
+	CHECK(dbenv3->repmgr_site(dbenv3, "::1", ports[2], &dbsite, 0));
 	CHECK(dbsite->set_config(dbsite, DB_LOCAL_SITE, 1));
 	CHECK(dbsite->close(dbsite));
-	CHECK(dbenv3->repmgr_site(dbenv3, "localhost", ports[0], &dbsite, 0));
+	CHECK(dbenv3->repmgr_site(dbenv3, "::1", ports[0], &dbsite, 0));
 	CHECK(dbsite->set_config(dbsite, DB_BOOTSTRAP_HELPER, 1));
 	CHECK(dbsite->close(dbsite));
 	CHECK(dbenv3->set_event_notify(dbenv3, notify));
@@ -431,7 +503,7 @@ int TestChannelFeature(CuTest *ct) {
 	 */
 	CuAssertTrue(ct,
 	    (ret = dbenv1->repmgr_site(dbenv1,
-		"localhost", ports[1], &dbsite, 0)) == 0);
+		"::1", ports[1], &dbsite, 0)) == 0);
 	CuAssertTrue(ct, (ret = dbsite->get_eid(dbsite, &eid)) == 0);
 	CuAssertTrue(ct, (ret = dbsite->close(dbsite)) == 0);
 	CuAssertTrue(ct, (ret = dbenv1->repmgr_channel(dbenv1, eid, &ch, 0)) == 0);
@@ -449,11 +521,10 @@ int TestChannelFeature(CuTest *ct) {
 	/* Wait til dbenv2 has reported 1 msg. */
 	info.dbenv = dbenv2;
 	info.count = 1;
-	await_condition(has_msgs, &info, 60);
+	await_condition(has_msgs, &info, 90);
 	rpt = get_rpt(dbenv2);
 	CuAssertTrue(ct, rpt->msg_count == 1);
-	CuAssertTrue(ct, mystrcmp(rpt->msg[0],
-		"No message dispatch call-back function has been configured") == 0);
+	CuAssertTrue(ct, strncmp(rpt->msg[0], "BDB3655", strlen("BDB3655")) == 0);
 
 	printf("2. send request with no msg dispatch in place\n");
 	clear_rpt(dbenv2);
@@ -461,10 +532,9 @@ int TestChannelFeature(CuTest *ct) {
 	CuAssertTrue(ct, ret == DB_NOSERVER);
 	if (resp.data != NULL)
 		free(resp.data);
-	await_condition(has_msgs, &info, 60);
+	await_condition(has_msgs, &info, 90);
 	CuAssertTrue(ct, rpt->msg_count == 1);
-	CuAssertTrue(ct, mystrcmp(rpt->msg[0],
-		"No message dispatch call-back function has been configured") == 0);
+	CuAssertTrue(ct, strncmp(rpt->msg[0], "BDB3655", strlen("BDB3655")) == 0);
 
 	CuAssertTrue(ct, (ret = dbenv2->repmgr_msg_dispatch(dbenv2, msg_disp, 0)) == 0);
 
@@ -476,8 +546,7 @@ int TestChannelFeature(CuTest *ct) {
 		free(resp.data);
 	await_done(dbenv2);
 	CuAssertTrue(ct, rpt->msg_count == 1);
-	CuAssertTrue(ct, mystrcmp(rpt->msg[0],
-		"Application failed to provide a response") == 0);
+	CuAssertTrue(ct, strncmp(rpt->msg[0], "BDB3656", strlen("BDB3656")) == 0);
 
 	printf("4. now with dispatch fn installed, send a simple async msg\n");
 	clear_rpt(dbenv2);
@@ -519,8 +588,7 @@ int TestChannelFeature(CuTest *ct) {
 	CuAssertTrue(ct, (ret = ch->send_request(ch, rdbts, 3, &resp, 0, 0)) == DB_BUFFER_SMALL);
 	await_done(dbenv2);
 	CuAssertTrue(ct, rpt->msg_count == 1);
-	CuAssertTrue(ct, mystrcmp(rpt->msg[0],
-		"originator's USERMEM buffer too small") == 0);
+	CuAssertTrue(ct, strncmp(rpt->msg[0], "BDB3659", strlen("BDB3659")) == 0);
 	CuAssertTrue(ct, rpt->ret == EINVAL);
 
 #define BUFLEN 20000
@@ -536,8 +604,7 @@ int TestChannelFeature(CuTest *ct) {
 	CuAssertTrue(ct, (ret = ch->send_request(ch, rdbts, 2, &resp, 0, 0)) == DB_BUFFER_SMALL);
 	await_done(dbenv2);
 	CuAssertTrue(ct, rpt->msg_count == 1);
-	CuAssertTrue(ct, mystrcmp(rpt->msg[0],
-		"originator does not accept multi-segment response") == 0);
+	CuAssertTrue(ct, strncmp(rpt->msg[0], "BDB3658", strlen("BDB3658")) == 0);
 	CuAssertTrue(ct, rpt->ret == EINVAL);
 
 	printf("9. send USERMEM request with DB_MULTIPLE\n");
@@ -685,7 +752,7 @@ int TestChannelFeature(CuTest *ct) {
 	CuAssertTrue(ct, (ret = dbenv1->repmgr_msg_dispatch(dbenv1, msg_disp3, 0)) == 0);
 	CuAssertTrue(ct,
 	    (ret = dbenv2->repmgr_site(dbenv2,
-		"localhost", ports[0], &dbsite, 0)) == 0);
+		"::1", ports[0], &dbsite, 0)) == 0);
 	CuAssertTrue(ct, (ret = dbsite->get_eid(dbsite, &eid)) == 0);
 	CuAssertTrue(ct, (ret = dbsite->close(dbsite)) == 0);
 	CuAssertTrue(ct, (ret = dbenv2->repmgr_channel(dbenv2, eid, &ch, 0)) == 0);
@@ -738,7 +805,7 @@ int TestChannelFeature(CuTest *ct) {
 	CuAssertTrue(ct, (ret = dbenv2->repmgr_msg_dispatch(dbenv2, msg_disp4, 0)) == 0);
 	CuAssertTrue(ct,
 	    (ret = dbenv2->repmgr_site(dbenv2,
-		"localhost", ports[2], &dbsite, 0)) == 0);
+		"::1", ports[2], &dbsite, 0)) == 0);
 	CuAssertTrue(ct, (ret = dbsite->get_eid(dbsite, &eid)) == 0);
 	CuAssertTrue(ct, (ret = dbsite->close(dbsite)) == 0);
 	CuAssertTrue(ct, (ret = dbenv2->repmgr_channel(dbenv2, eid, &ch, 0)) == 0);
@@ -776,12 +843,9 @@ int TestChannelFeature(CuTest *ct) {
 	rpt = get_rpt(dbenv3);
 	CuAssertTrue(ct, rpt->ret == EINVAL);
 	CuAssertTrue(ct, rpt->msg_count == 3);
-	CuAssertTrue(ct, mystrcmp(rpt->msg[0],
- "set_timeout() invalid on DB_CHANNEL supplied to msg dispatch function") == 0);
-	CuAssertTrue(ct, mystrcmp(rpt->msg[1],
-       "close() invalid on DB_CHANNEL supplied to msg dispatch function") == 0);
-	CuAssertTrue(ct, mystrcmp(rpt->msg[2],
-"send_request() invalid on DB_CHANNEL supplied to msg dispatch function") == 0);
+	CuAssertTrue(ct, strncmp(rpt->msg[0], "BDB3660", strlen("BDB3660")) == 0);
+	CuAssertTrue(ct, strncmp(rpt->msg[1], "BDB3660", strlen("BDB3660")) == 0);
+	CuAssertTrue(ct, strncmp(rpt->msg[2], "BDB3660", strlen("BDB3660")) == 0);
 	ch->close(ch, 0);
 
 	free(buffer);
@@ -1263,23 +1327,6 @@ test_zeroes(ch, dest, ct)
 		free(resp.data);
 }	
 
-/*
- * Compare, but skip over BDB error msg number at beginning of `actual'.
- */
-static int
-mystrcmp(actual, expected)
-	char *actual;
-	const char *expected;
-{
-	char *p;
-
-	for (p = actual; *p != '\0' && !isspace(*p); p++)
-		;
-	for (; *p != '\0' && isspace(*p); p++)
-		;
-	return (strcmp(p, expected));
-}
-
 static int get_avail_ports(ports, count)
 	u_int *ports;
 	int count;
@@ -1334,8 +1381,8 @@ static int get_avail_ports(ports, count)
 		i = incr;
 
 		while (i-- > 0) {
-			if (ret = __repmgr_getaddr(NULL, "localhost", curport,
-			    AI_PASSIVE, &orig_ai) != 0)
+			if ((ret = __repmgr_getaddr(NULL, "::1", curport,
+			    AI_PASSIVE, &orig_ai)) != 0)
 				goto end;
 
 			for (ai = orig_ai; ai != NULL; ai = ai->ai_next) {

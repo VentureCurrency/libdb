@@ -1,7 +1,7 @@
 /*-
- * See the file LICENSE for redistribution information.
+ * Copyright (c) 1997, 2020 Oracle and/or its affiliates.  All rights reserved.
  *
- * Copyright (c) 1997, 2012 Oracle and/or its affiliates.  All rights reserved.
+ * See the file EXAMPLES-LICENSE for license information.
  *
  * $Id$
  */
@@ -82,11 +82,13 @@ main(int argc, char *argv[])
 void
 db_setup(const char *home, const char *data_dir, ostream& err_stream)
 {
+	const char * err1 = "DbEnv::open: No such file or directory";
+	const char * err2 = "Db::open: No such file or directory";
 	//
 	// Create an environment object and initialize it for error
 	// reporting.
 	//
-	DbEnv *dbenv = new DbEnv(0);
+	DbEnv *dbenv = new DbEnv((u_int32_t)0);
 	dbenv->set_error_stream(&err_stream);
 	dbenv->set_errpfx(progname);
 
@@ -100,9 +102,19 @@ db_setup(const char *home, const char *data_dir, ostream& err_stream)
 	(void)dbenv->set_data_dir(data_dir);
 
 	// Open the environment with full transactional support.
-	dbenv->open(home,
-	    DB_CREATE | DB_INIT_LOCK | DB_INIT_LOG | DB_INIT_MPOOL | 
-	    DB_INIT_TXN, 0);
+	try {
+		dbenv->open(home,
+		    DB_CREATE | DB_INIT_LOCK | DB_INIT_LOG | DB_INIT_MPOOL | 
+		    DB_INIT_TXN, 0);
+	}
+	catch (DbException &dbe) {
+		cerr << "EnvExample: " << dbe.what() << "\n";
+		if (!strcmp(dbe.what(), err1)){
+			cout << "Please check whether "
+			    << "home dir \"" << home << "\" exists.\n";
+		}
+		exit (-1);
+	}
 
 	// Open a database in the environment to verify the data_dir
 	// has been set correctly.
@@ -110,7 +122,18 @@ db_setup(const char *home, const char *data_dir, ostream& err_stream)
 	Db *db = new Db(dbenv, 0) ;
 
 	// Open the database. 
-	db->open(NULL, "EvnExample_db1.db", NULL, DB_BTREE, DB_CREATE, 0644);
+	try {
+		db->open(NULL, "EvnExample_db1.db", 
+		    NULL, DB_BTREE, DB_CREATE, 0644);
+	}
+	catch (DbException &dbe) {
+		cerr << "EnvExample: " << dbe.what() << "\n";
+		if (!strcmp(dbe.what(), err2)){
+			cout << "Please check whether data dir \"" << data_dir
+			    << "\" exists under \"" << home << "\"\n";
+		}
+		exit (-1);
+	}
 
 	// Close the database handle.
 	db->close(0) ;
@@ -125,7 +148,7 @@ void
 db_teardown(const char *home, const char *data_dir, ostream& err_stream)
 {
 	// Remove the shared database regions.
-	DbEnv *dbenv = new DbEnv(0);
+	DbEnv *dbenv = new DbEnv((u_int32_t)0);
 
 	dbenv->set_error_stream(&err_stream);
 	dbenv->set_errpfx(progname);

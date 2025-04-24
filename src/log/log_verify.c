@@ -1,7 +1,7 @@
 /*-
- * See the file LICENSE for redistribution information.
+ * Copyright (c) 1996, 2020 Oracle and/or its affiliates.  All rights reserved.
  *
- * Copyright (c) 1996, 2012 Oracle and/or its affiliates.  All rights reserved.
+ * See the file LICENSE for license information.
  *
  * $Id$
  */
@@ -24,6 +24,9 @@
 static int __env_init_verify __P((ENV *, u_int32_t, DB_DISTAB *));
 
 /*
+ * __log_verify_pp --
+ *	The DB_ENV->log_verify() API call.
+ *
  * PUBLIC: int __log_verify_pp __P((DB_ENV *, const DB_LOG_VERIFY_CONFIG *));
  */
 int
@@ -38,6 +41,15 @@ __log_verify_pp(dbenv, lvconfig)
 	lsnrg = ret = timerg = 0;
 	phome = NULL;
 
+	if (!LOGGING_ON(dbenv->env)) {
+		return (__db_not_log_env(dbenv->env));
+	}
+	if (lvconfig == NULL) {
+		ret = USR_ERR(dbenv->env, EINVAL);
+		__db_errx(dbenv->env, DB_STR("2584",
+		    "Must provide a configuration structure."));
+		goto err;
+	}
 	if (!IS_ZERO_LSN(lvconfig->start_lsn) ||
 	    !IS_ZERO_LSN(lvconfig->end_lsn))
 		lsnrg = 1;
@@ -47,24 +59,25 @@ __log_verify_pp(dbenv, lvconfig)
 	if ((!IS_ZERO_LSN(lvconfig->start_lsn) && lvconfig->start_time != 0) ||
 	    (!IS_ZERO_LSN(lvconfig->end_lsn) && lvconfig->end_time != 0) ||
 	    (lsnrg && timerg)) {
+		ret = USR_ERR(dbenv->env, EINVAL);
 		__db_errx(dbenv->env, DB_STR("2501",
 		    "Set either an lsn range or a time range to verify logs "
 		    "in the range, don't mix time and lsn."));
-		ret = EINVAL;
 		goto err;
 	}
 	phome = dbenv->env->db_home;
 	if (phome != NULL && lvconfig->temp_envhome != NULL &&
 	    strcmp(phome, lvconfig->temp_envhome) == 0) {
+		ret = USR_ERR(dbenv->env, EINVAL);
 		__db_errx(dbenv->env,
 		    "Environment home for log verification internal use "
 		    "overlaps with that of the environment to verify.");
-		ret = EINVAL;
 		goto err;
 	}
 
 	ENV_ENTER(dbenv->env, ip);
-	ret = __log_verify(dbenv, lvconfig, ip);
+	REPLICATION_WRAP(dbenv->env,
+	    (__log_verify(dbenv, lvconfig, ip)), 0, ret);
 	ENV_LEAVE(dbenv->env, ip);
 err:	return (ret);
 }
@@ -79,18 +92,16 @@ __log_verify(dbenv, lvconfig, ip)
 	const DB_LOG_VERIFY_CONFIG *lvconfig;
 	DB_THREAD_INFO *ip;
 {
-
-	u_int32_t logcflag, max_fileno;
+	DB_LOG_VRFY_INFO *logvrfy_hdl;
 	DB_LOGC *logc;
-	ENV *env;
-	DBT data;
 	DB_DISTAB dtab;
 	DB_LSN key, start, start2, stop, stop2, verslsn;
-	u_int32_t newversion, version;
+	DBT data;
+	ENV *env;
+	u_int32_t logcflag, max_fileno, newversion, version;
 	int cmp, fwdscroll, goprev, ret, tret;
 	time_t starttime, endtime;
 	const char *okmsg;
-	DB_LOG_VRFY_INFO *logvrfy_hdl;
 
 	okmsg = NULL;
 	fwdscroll = 1;
@@ -98,6 +109,7 @@ __log_verify(dbenv, lvconfig, ip)
 	goprev = 0;
 	env = dbenv->env;
 	logc = NULL;
+	logvrfy_hdl = NULL;
 	memset(&dtab, 0, sizeof(dtab));
 	memset(&data, 0, sizeof(data));
 	version = newversion = 0;
@@ -333,11 +345,12 @@ out:
 err:
 	if (logc != NULL)
 		(void)__logc_close(logc);
-	if ((tret = __destroy_log_vrfy_info(logvrfy_hdl)) != 0 && ret == 0)
+	if (logvrfy_hdl != NULL &&
+	    (tret = __destroy_log_vrfy_info(logvrfy_hdl)) != 0 && ret == 0)
 		ret = tret;
-	if (dtab.int_dispatch)
+	if (dtab.int_dispatch != NULL)
 		__os_free(dbenv->env, dtab.int_dispatch);
-	if (dtab.ext_dispatch)
+	if (dtab.ext_dispatch != NULL)
 		__os_free(dbenv->env, dtab.ext_dispatch);
 
 	return (ret);
@@ -390,9 +403,9 @@ __env_init_verify(env, version, dtabp)
 		break;
 
 	default:
+		ret = USR_ERR(env, EINVAL);
 		__db_errx(env, DB_STR_A("2505", "Not supported version %lu",
 		    "%lu"), (u_long)version);
-		ret = EINVAL;
 		break;
 	}
 err:	return (ret);

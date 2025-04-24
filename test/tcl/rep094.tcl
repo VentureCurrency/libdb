@@ -1,10 +1,10 @@
-# See the file LICENSE for redistribution information.
+# Copyright (c) 2010, 2020 Oracle and/or its affiliates.  All rights reserved.
 #
-# Copyright (c) 2010, 2012 Oracle and/or its affiliates.  All rights reserved.
+# See the file LICENSE for license information.
 #
 # TEST	rep094
 # TEST	Full election with less than majority initially connected.
-#
+# TEST
 # TEST	Cold-boot a 4-site group.  The first two sites start quickly and
 # TEST	initiate an election.  The other two sites don't join the election until
 # TEST	the middle of the long full election timeout period.  It's important that

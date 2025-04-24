@@ -1,16 +1,17 @@
-# See the file LICENSE for redistribution information.
+# Copyright (c) 1999, 2020 Oracle and/or its affiliates.  All rights reserved.
 #
-# Copyright (c) 1999, 2012 Oracle and/or its affiliates.  All rights reserved.
+# See the file LICENSE for license information.
 #
 # $Id$
 #
 # TEST	sec001
 # TEST	Test of security interface
-proc sec001 { } {
+proc sec001 { {args "" } } {
 	global errorInfo
 	global errorCode
 	global has_crypto
 	global is_hp_test
+	global number_of_slices
 
 	source ./include.tcl
 	# Skip test if release does not support encryption.
@@ -24,14 +25,18 @@ proc sec001 { } {
 	set subdb1 sub1
 	set subdb2 sub2
 
-	puts "Sec001: Test of basic encryption interface."
+	if { [llength $args] > 0 } {
+		puts "Sec001: Test of basic encryption interface $args."
+	} else {
+		puts "Sec001: Test of basic encryption interface."
+	}
 	env_cleanup $testdir
 
 	set passwd1 "passwd1"
 	set passwd1_bad "passwd1_bad"
 	set passwd2 "passwd2"
 	set key "key"
-	set data "data"
+	set data "a string of data"
 
 	#
 	# This first group tests bad create scenarios and also
@@ -44,6 +49,7 @@ proc sec001 { } {
 	error_check_good db [is_valid_db $db] TRUE
 	error_check_good dbput [$db put $key $data] 0
 	error_check_good dbclose [$db close] 0
+	error_check_good search_db [findstring $data $testfile2] 0
 
 	puts "\tSec001.a.2: Open db without encryption."
 	set stat [catch {berkdb_open_noerr $testfile2} ret]
@@ -57,6 +63,7 @@ proc sec001 { } {
 	error_check_good db [is_valid_db $db] TRUE
 	error_check_good dbput [$db put $key $data] 0
 	error_check_good dbclose [$db close] 0
+	error_check_good search_db [findstring $data $testfile2] 1
 
 	puts "\tSec001.b.2: Open db with encryption."
 	set stat [catch {berkdb_open_noerr -encryptaes $passwd1 $testfile2} ret]
@@ -187,6 +194,14 @@ proc sec001 { } {
 	    -encryptaes $passwd2 $testfile1} ret]
 	error_check_good db:$passwd2 $stat 1
 	error_check_good env:fail [is_substr $ret "method not permitted"] 1
+	
+	puts "\tSec001.g.8: Open database in encrypted environment."
+	set db [berkdb_open -encrypt -create -btree -env $env $testfile1]
+	error_check_good db [is_valid_db $db] TRUE
+	error_check_good dbput [$db put $key $data] 0
+	error_check_good dbclose [$db close] 0
+	error_check_good search_db [findstring $data $testdir/$testfile1] 0
+	set ret [$env dbremove $testfile1]
 
 	puts "\tSec001.g.8: Close creating env"
 	error_check_good envclose [$env close] 0
@@ -215,8 +230,50 @@ proc sec001 { } {
 	set env1 [berkdb_env -home $testdir -encryptaes $passwd1]
 	error_check_good env [is_valid_env $env1] TRUE
 
-	error_check_good envclose [$env1 close] 0
+	if { $number_of_slices > 0 } {
+		puts "\tSec001.i: Open an encrypted database in a sliced env."
+		set db [berkdb_open -create \
+		    -encrypt -chksum -env $env -btree $args $testfile1]
+		error_check_good valid_slice [is_valid_db $db] TRUE
+		if { [string match "*-sliced*" $args] } {
+			puts "\tSec001.i.1: Check the slices are encrypted."
+			set slices [$db get_slices]
+			foreach slice $slices {
+				set flags [$slice get_flags]
+				error_check_good slice_encrypt \
+				    [string match "*-encrypt*" $flags] 1
+				error_check_good slice_chksum \
+				    [string match "*-chksum*" $flags] 1
+			}
+		}
+		error_check_good dbslice_close [$db close] 0
+
+		# Since a non-standard password is used on the encrypted
+		# slice environment, calling env_cleanup will not work.
+		# Have to do the directory cleanup locally.
+		error_check_good envclose [$env1 close] 0
+		cleanup $testdir $env
+		error_check_good envclose [$env close] 0
+		log_cleanup $testdir
+		cleanup $testdir NULL
+	} else {
+		error_check_good envclose [$env1 close] 0
+		error_check_good envclose [$env close] 0
+	}
+
+	puts "\tSec001.i.1: Open without encryption."
+	cleanup $testdir NULL
+	set env [berkdb_env_noerr -create -home $testdir]
+	error_check_good env [is_valid_env $env] TRUE
+
+	puts "\tSec001.i.2: Open database in unencrypted environment."
+	set db [berkdb_open -create -env $env -btree $testfile1]
+	error_check_good db [is_valid_db $db] TRUE
+	error_check_good dbput [$db put $key $data] 0
+	error_check_good dbclose [$db close] 0
+	error_check_good search_db [findstring $data $testdir/$testfile1] 1
 	error_check_good envclose [$env close] 0
+	cleanup $testdir NULL
 
 	puts "\tSec001 complete."
 }

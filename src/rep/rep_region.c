@@ -1,7 +1,7 @@
 /*-
- * See the file LICENSE for redistribution information.
+ * Copyright (c) 2001, 2020 Oracle and/or its affiliates.  All rights reserved.
  *
- * Copyright (c) 2001, 2012 Oracle and/or its affiliates.  All rights reserved.
+ * See the file LICENSE for license information.
  *
  * $Id$
  */
@@ -9,11 +9,14 @@
 #include "db_config.h"
 
 #include "db_int.h"
+#include "dbinc/blob.h"
 #include "dbinc/db_page.h"
 #include "dbinc/db_am.h"
 
 static int __rep_egen_init  __P((ENV *, REP *));
 static int __rep_gen_init  __P((ENV *, REP *));
+static int __rep_view_init  __P((ENV *, REP *));
+static int __rep_viewfile_exists  __P((ENV *, int *));
 
 /*
  * __rep_open --
@@ -29,7 +32,7 @@ __rep_open(env)
 	REGENV *renv;
 	REGINFO *infop;
 	REP *rep;
-	int i, ret;
+	int i, ret, view;
 	char *p;
 	char fname[sizeof(REP_DIAGNAME) + 3];
 
@@ -37,10 +40,15 @@ __rep_open(env)
 	infop = env->reginfo;
 	renv = infop->primary;
 	ret = 0;
+	view = 0;
 	DB_ASSERT(env, DBREP_DIAG_FILES < 100);
 
 	if (renv->rep_off == INVALID_ROFF) {
-		/* Must create the region. */
+		/*
+		 * Must create the region. This environment either is being
+		 * created for the first time or has just had its regions
+		 * cleared by a recovery.
+		 */
 		if ((ret = __env_alloc(infop, sizeof(REP), &rep)) != 0)
 			return (ret);
 		memset(rep, 0, sizeof(*rep));
@@ -80,6 +88,10 @@ __rep_open(env)
 		    env, MTX_REP_START, 0, &rep->mtx_repstart)) != 0)
 			return (ret);
 
+		if ((ret = __mutex_alloc(
+		    env, MTX_LSN_HISTORY, 0, &db_rep->mtx_lsnhist)) != 0)
+			return (ret);
+
 		rep->diag_off = 0;
 		rep->diag_index = 0;
 		rep->newmaster_event_gen = 0;
@@ -108,6 +120,23 @@ __rep_open(env)
 			return (ret);
 		if ((ret = __rep_egen_init(env, rep)) != 0)
 			return (ret);
+		/*
+		 * Determine if this is a view site or not.  It is a view
+		 * if the callback is set.  If the site was a view in the
+		 * past, we mark it as a view, but will check consistency
+		 * later when starting replication.
+		 */
+		if (db_rep->partial != NULL) {
+			rep->stat.st_view = 1;
+			if ((ret = __rep_view_init(env, rep)) != 0)
+				return (ret);
+		} else {
+			if ((ret = __rep_viewfile_exists(env, &view)) != 0)
+				return (ret);
+			if (view)
+				rep->stat.st_view = 1;
+		}
+
 		rep->gbytes = db_rep->gbytes;
 		rep->bytes = db_rep->bytes;
 		rep->request_gap = db_rep->request_gap;
@@ -122,6 +151,7 @@ __rep_open(env)
 		timespecclear(&rep->grant_expire);
 		rep->chkpt_delay = db_rep->chkpt_delay;
 		rep->priority = db_rep->my_priority;
+		rep->initsites = env->dbenv->rep_init_sites;
 
 		if ((ret = __rep_lockout_archive(env, rep)) != 0)
 			return (ret);
@@ -156,6 +186,32 @@ __rep_open(env)
 			    "Application type mismatch for a replication "
 			    "process joining the environment"));
 			return (EINVAL);
+		}
+		/*
+		 * If we are joining an existing environment and we
+		 * have a view callback set, then the environment must
+		 * already be a view.  If not, error.
+		 *
+		 * The other mismatch is not an error here (no callback
+		 * set, but environment is a view) because we may be a
+		 * rep unaware process such as db_stat and that is allowed
+		 * to proceed.  There is additional checking in other rep
+		 * functions like rep_start to confirm consistency before
+		 * using replication.
+		 */
+		if (db_rep->partial != NULL) {
+			if ((ret = __rep_viewfile_exists(env, &view)) != 0)
+				return (ret);
+			/*
+			 * If there is a callback, and we are not in-memory,
+			 * there better be a view system file too.
+			 */
+			if (view == 0 && !FLD_ISSET(rep->config, REP_C_INMEM)) {
+				__db_errx(env, DB_STR("3688",
+				    "Application environment and view mismatch "
+				    "joining the environment"));
+				return (EINVAL);
+			}
 		}
 #ifdef HAVE_REPLICATION_THREADS
 		if ((ret = __repmgr_join(env, rep)) != 0)
@@ -279,6 +335,9 @@ __rep_env_refresh(env)
 			if ((t_ret = __mutex_free(env,
 			    &rep->mtx_repstart)) != 0 && ret == 0)
 				ret = t_ret;
+			if ((t_ret = __mutex_free(env,
+			    &db_rep->mtx_lsnhist)) != 0 && ret == 0)
+				ret = t_ret;
 
 			/* Discard commit queue elements. */
 			DB_ASSERT(env, SH_TAILQ_EMPTY(&rep->waiters));
@@ -365,10 +424,12 @@ __rep_preclose(env)
 	if (db_rep == NULL || db_rep->region == NULL)
 		return (ret);
 
+	MUTEX_LOCK(env, db_rep->mtx_lsnhist);
 	if ((dbp = db_rep->lsn_db) != NULL) {
 		ret = __db_close(dbp, NULL, DB_NOSYNC);
 		db_rep->lsn_db = NULL;
 	}
+	MUTEX_UNLOCK(env, db_rep->mtx_lsnhist);
 
 	MUTEX_LOCK(env, db_rep->region->mtx_clientdb);
 	if (db_rep->rep_db != NULL) {
@@ -506,9 +567,8 @@ __rep_write_egen(env, rep, egen)
 	 * If running in-memory replication, return without any file
 	 * operations.
 	 */
-	if (FLD_ISSET(rep->config, REP_C_INMEM)) {
+	if (FLD_ISSET(rep->config, REP_C_INMEM))
 		return (0);
-	}
 
 	if ((ret = __db_appname(env,
 	    DB_APP_META, REP_EGENNAME, NULL, &p)) != 0)
@@ -591,9 +651,8 @@ __rep_write_gen(env, rep, gen)
 	 * If running in-memory replication, return without any file
 	 * operations.
 	 */
-	if (FLD_ISSET(rep->config, REP_C_INMEM)) {
+	if (FLD_ISSET(rep->config, REP_C_INMEM))
 		return (0);
-	}
 
 	if ((ret = __db_appname(env,
 	    DB_APP_META, REP_GENNAME, NULL, &p)) != 0)
@@ -607,4 +666,206 @@ __rep_write_gen(env, rep, gen)
 	}
 	__os_free(env, p);
 	return (ret);
+}
+
+/*
+ * __rep_view_init --
+ *	Initialize the permanent view file to know this site is a view
+ *	forever.  The existence of the file is the record.
+ */
+static int
+__rep_view_init(env, rep)
+	ENV *env;
+	REP *rep;
+{
+	DB_FH *fhp;
+	int ret;
+	char *p;
+
+	/*
+	 * If running in-memory replication, return without any file
+	 * operations.
+	 */
+	if (FLD_ISSET(rep->config, REP_C_INMEM))
+		return (0);
+
+	if ((ret = __db_appname(env,
+	    DB_APP_META, REPVIEW, NULL, &p)) != 0)
+		return (ret);
+
+	/*
+	 * If the file doesn't exist, create it.  We just want to open
+	 * and close the file.  It doesn't have any content.
+	 * If the file already exists, there is nothing else to do.
+	 */
+	if (__os_exists(env, p, NULL) != 0) {
+		RPRINT(env, (env, DB_VERB_REP_MISC, "View init: Create %s", p));
+		if ((ret = __os_open(env, p, 0,
+		    DB_OSO_CREATE | DB_OSO_TRUNC, DB_MODE_600, &fhp)) != 0)
+			goto out;
+		(void)__os_closehandle(env, fhp);
+	}
+out:	__os_free(env, p);
+	return (ret);
+}
+
+/*
+ * __rep_check_view --
+ *	Check consistency between the view file and the db_rep handle.
+ *
+ * PUBLIC: int __rep_check_view __P((ENV *));
+ */
+int
+__rep_check_view(env)
+	ENV *env;
+{
+	DB_REP *db_rep;
+	REP *rep;
+	int exist, ret;
+
+	db_rep = env->rep_handle;
+	rep = db_rep->region;
+	ret = 0;
+
+	/*
+	 * If running in-memory replication, check without any file
+	 * operations.  We can only check what exists in the region,
+	 * which is the st_view field from a previous open.
+	 */
+	if (FLD_ISSET(rep->config, REP_C_INMEM))
+		exist = (int)rep->stat.st_view;
+	else if ((ret = __rep_viewfile_exists(env, &exist)) != 0)
+		return (ret);
+
+	RPRINT(env, (env, DB_VERB_REP_MISC, "Check view.  Exist %d, cb %d",
+	    exist, (db_rep->partial != NULL)));
+	/*
+	 * If view file exists, a partial function must be set.
+	 * If view file does not exist, a partial function must not be set.
+	 */
+	if ((exist == 0 && db_rep->partial != NULL) ||
+	    (exist == 1 && db_rep->partial == NULL))
+		ret = EINVAL;
+	return (ret);
+}
+
+static int
+__rep_viewfile_exists(env, existp)
+	ENV *env;
+	int *existp;
+{
+	char *p;
+	int ret;
+
+	*existp = 0;
+	if ((ret = __db_appname(env,
+	    DB_APP_META, REPVIEW, NULL, &p)) != 0)
+		return (ret);
+
+	if (__os_exists(env, p, NULL) == 0)
+		*existp = 1;
+
+	__os_free(env, p);
+	return (ret);
+
+}
+
+/*
+ * __rep_object_size --
+ *	Return the initial amount of space needed for the rep objects in
+ *	the main environment region.  This includes:
+ *	    The database file list for internal init (originfo, curinfo)
+ *	    The vote1 and vote2 tally areas for elections (tally, v2tally)
+ *	    The lease grant table for a client when master leases are in use
+ *	    Information about each site managed by Replication Manager
+ *
+ * PUBLIC: size_t __rep_object_size __P((ENV *));
+ */
+size_t
+__rep_object_size(env)
+	ENV *env;
+{
+	DB_ENV *dbenv;
+	size_t blobdirlen, gendirsize, s, uidsize;
+	u_int32_t dblenval, dbval, extfiledbval, siteval;
+
+	dbenv = env->dbenv;
+	s = 0;
+	blobdirlen = 0;
+	uidsize = DB_FILE_ID_LEN * sizeof(u_int8_t);
+
+	/* Use default values for any types the user didn't set. */
+	if ((dbval = dbenv->db_init_databases) == 0)
+		dbval = 10;
+	if ((dblenval = dbenv->db_init_db_len) == 0)
+		dblenval = 50;
+	/* Default for external file databases is 0. */
+	extfiledbval = dbenv->db_init_extfile_dbs;
+	if ((siteval = dbenv->rep_init_sites) == 0)
+		siteval = 5;
+
+	/*
+	 * Calculate size for internal init list of databases.  This
+	 * list is stored in originfo and we add an additional database
+	 * each for curinfo and the rep system database.
+	 *
+	 * For each database, we calculate the size of its structures,
+	 * the database directory/name string and one separator.
+	 */
+	s += (dbval + 2) *
+	    (sizeof(__rep_fileinfo_args) + uidsize + 1 + dblenval);
+
+	/*
+	 * Calculate size external file blob metadatabases (BMDs), if any.
+	 * We add an additional BMD for the top-level BMD that is always
+	 * present.  BMDs are stored in the external file directory
+	 * dbenv->db_blob_dir, which must be configured before opening
+	 * the environment.
+	 *
+	 * Each BMD uses the same name and is placed in a different
+	 * generated directory.  There can be up to two levels of
+	 * generated directory in the format __db######...  We use 6
+	 * digits for our generated directory name estimate.
+	 *
+	 * For each BMD, we calculate the size of its structures,
+	 * add the external file directory, generated directories,
+	 * 3 separators, and fixed BMD name string.
+	 */
+	if (extfiledbval > 0) {
+		if (dbenv->db_blob_dir != NULL)
+			blobdirlen = strlen(dbenv->db_blob_dir);
+		gendirsize = 2 * (strlen(BLOB_DIR_PREFIX) + 6);
+		s += (extfiledbval + 1) *
+		    (sizeof(__rep_fileinfo_args) + uidsize + blobdirlen +
+		    gendirsize + 3 + strlen(BLOB_META_FILE_NAME));
+	}
+
+	/*
+	 * Calculate size for base replication lease table and V1/V2
+	 * vote tally areas.
+	 */
+	s += siteval * ((2 * sizeof(REP_VTALLY)) + sizeof(REP_LEASE_ENTRY));
+
+#ifdef HAVE_REPLICATION_THREADS
+	/*
+	 * Calculate size for repmgr site structures.  Use default of
+	 * 50 characters for hostname.
+	 */
+	s += siteval * (sizeof(SITEINFO) + 50);
+#endif
+	return (s);
+}
+
+/*
+ * __rep_object_max --
+ *	Return how much additional memory to allow in the environment region
+ *	so that all rep-specific data structures can be allocated.
+ *
+ * PUBLIC: size_t __rep_object_max __P((ENV *));
+ */
+size_t
+__rep_object_max(env)
+	ENV *env;
+{
+	return (4 * __rep_object_size(env));
 }
